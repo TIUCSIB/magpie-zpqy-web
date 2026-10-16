@@ -1,0 +1,8 @@
+node_modules/
+*.log
+.DS_Store
+# 本地凭据/调试产物, 绝不提交
+plugin-auth.json
+credentials.json
+*.sqlite
+notes/
