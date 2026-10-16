@@ -409,6 +409,18 @@ const textOf = (content) =>
   : Array.isArray(content) ? content.map((c) => (c && typeof c.text === "string" ? c.text : "")).join("")
   : ""
 
+// 清言 SSE 不返回 usage, 网关按 0 记账会显示「还没用过」。这里估算: CJK 1 字 ≈ 1 token,
+// 其余 4 字符 ≈ 1 token(粗略但够路由/统计用)。
+function estimateTokens(s) {
+  let cjk = 0, other = 0
+  for (const ch of String(s || "")) {
+    const c = ch.codePointAt(0)
+    if ((c >= 0x3000 && c <= 0x9fff) || (c >= 0xac00 && c <= 0xd7af) || (c >= 0xf900 && c <= 0xfaff) || (c >= 0x20000 && c <= 0x2fa1f)) cjk++
+    else other++
+  }
+  return cjk + Math.ceil(other / 4)
+}
+
 // 会话映射: conv id → 已发送的用户消息文本序列(上下文由清言服务端保存)
 const convs = new Map()
 const CONV_MAX = 48
@@ -666,6 +678,12 @@ export async function ChatglmAuthPlugin({ client }) {
               const users = Array.isArray(m) ? m.filter((x) => x.role === "user").map((x) => textOf(x.content)) : []
               return users.length ? users : [req.text]
             }
+            // 清言不返回 usage → 估算, 否则网关按 0 记账显示「还没用过」
+            const usageEstimate = () => {
+              const prompt = estimateTokens((Array.isArray(openai.messages) ? openai.messages : []).map((m) => textOf(m.content)).join("\n"))
+              const completion = estimateTokens(sse.text) + estimateTokens(sse.think)
+              return { prompt_tokens: prompt, completion_tokens: completion, total_tokens: prompt + completion }
+            }
 
             const sse = new ChatglmSSE(model)
             if (openai.stream === false) {
@@ -680,7 +698,7 @@ export async function ChatglmAuthPlugin({ client }) {
               return new Response(JSON.stringify({
                 id: sse.id, object: "chat.completion", created: Math.floor(Date.now() / 1000), model,
                 choices: [{ index: 0, message: { role: "assistant", content: sse.text || `[chatglm] 空回复${sse.error ? `: ${sse.error}` : ""}` }, finish_reason: "stop" }],
-                usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+                usage: usageEstimate(),
               }), { status: 200, headers: { "content-type": "application/json", "x-magpie-sign-in": "kept" } })
             }
 
@@ -695,6 +713,8 @@ export async function ChatglmAuthPlugin({ client }) {
                 const finish = () => {
                   if (sse.conv) remember(sse.conv, nextUsers(openai.messages))
                   if (!sse.finished) sse.end()
+                  // 标准 OpenAI 流式 usage 尾块(choices 空)
+                  ctrl.enqueue(enc.encode("data: " + JSON.stringify({ id: sse.id, object: "chat.completion.chunk", created: Math.floor(Date.now() / 1000), model: sse.model, choices: [], usage: usageEstimate() }) + "\n\n"))
                   ctrl.enqueue(enc.encode("data: [DONE]\n\n"))
                   ctrl.close()
                 }
