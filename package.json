@@ -1,6 +1,6 @@
 {
   "name": "opencode-chatglm-auth",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "description": "OpenCode/magpie provider plugin: 智谱清言 (chatglm.cn) 网页版接口, 含提示词协议工具调用",
   "type": "module",
   "main": "./index.mjs",

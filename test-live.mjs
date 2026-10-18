@@ -90,7 +90,7 @@ if (r1.calls?.length) {
   check('HTTP 200', r2.status === 200, JSON.stringify(r2).slice(0, 300))
   check('最终回答是文本', r2.finish === 'stop' && r2.content.length > 0, `finish=${r2.finish}`)
   check('答到了文件内容', /hello/.test(r2.content || ''), r2.content.slice(0, 200))
-  check('复用会话(只发增量, prompt 明显小于全量内联)', r2.usage?.prompt_tokens < (r1.usage?.prompt_tokens || 0), `r1=${r1.usage?.prompt_tokens} r2=${r2.usage?.prompt_tokens}`)
+  check('prompt 随轮次累加(按客户端完整上下文计账, 不再是 in=2)', r2.usage?.prompt_tokens > (r1.usage?.prompt_tokens || 0), `r1=${r1.usage?.prompt_tokens} r2=${r2.usage?.prompt_tokens}`)
 } else {
   fail++; console.log('  ✗ 用例 1 没给出 tool_calls, 跳过')
 }

@@ -734,6 +734,9 @@ function translateRequest(openai, tools) {
   const turns = msgs.filter((m) => m.role !== "system" && m.role !== "developer").map(renderTurn)
   const mine = turns.filter((t) => t.role !== "assistant")
   const sig = mine.map((t) => md5hex(t.text))
+  // 计账用的完整上下文: 系统提示 + 工具清单 + 全部回合(含 assistant)。与实际发什么无关 ——
+  // 发的是增量还是全量只是传输方式, 客户端的上下文总量是一样的。
+  const fullText = [sys && `# 系统指令(必须遵循)\n${sys}`, tools.length && TOOL_PROTOCOL(tools), ...turns.map((t) => t.text)].filter(Boolean).join("\n\n")
 
   let best = null
   for (const [conv, sent] of convs) {
@@ -745,7 +748,7 @@ function translateRequest(openai, tools) {
   if (best && sig.length > best.sent.length) {
     const fresh = mine.slice(best.sent.length)
     let text = fresh.map((t, i) => (t.role === "tool" && i === fresh.length - 1 ? `${t.text}\n\n${TOOL_REMINDER}` : t.text)).join("\n\n")
-    return { conv: best.conv, text, sig }
+    return { conv: best.conv, text, sig, fullText }
   }
 
   const hist = turns
@@ -758,7 +761,7 @@ function translateRequest(openai, tools) {
   if (tools.length) parts.push(TOOL_PROTOCOL(tools))
   if (hist) parts.push(`# 对话历史(接续)\n${hist}`)
   parts.push(`# 本轮用户消息\n${last || "(空)"}`)
-  return { conv: "", text: parts.join("\n\n"), sig }
+  return { conv: "", text: parts.join("\n\n"), sig, fullText }
 }
 
 // 清言 SSE 事件 → OpenAI chat.completion.chunk。
@@ -1083,12 +1086,15 @@ export async function ChatglmAuthPlugin({ client }) {
             const sse = new ChatglmSSE(model, { tools })
             sse.holdEnd = true // finish 帧只标记回合结束; 空转时还要补一轮
 
-            // 清言不返回 usage → 估算, 否则网关按 0 记账显示「还没用过」
-            const usageEstimate = () => {
-              const prompt = estimateTokens(req.text)
-              const completion = estimateTokens(sse.text) + estimateTokens(sse.think)
-              return { prompt_tokens: prompt, completion_tokens: completion, total_tokens: prompt + completion }
-            }
+            // 清言不返回 usage → 估算, 否则网关按 0 记账显示「还没用过」。
+            // prompt 按客户端完整上下文估(系统提示+全部历史+工具清单), 不能按 req.text:
+            // 会话复用时增量可能只有「继续」两个字, 用量页会显示 in=2, 被误读成「没消耗」。
+            const promptTokens = estimateTokens(req.fullText || req.text)
+            const usageEstimate = () => ({
+              prompt_tokens: promptTokens,
+              completion_tokens: estimateTokens(sse.text) + estimateTokens(sse.think),
+              total_tokens: promptTokens + estimateTokens(sse.text) + estimateTokens(sse.think),
+            })
 
             // 一轮的 SSE 流进 sse; 回合结束(roundDone)就停, 不等连接关闭
             const pump = async (res) => {
