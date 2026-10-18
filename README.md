@@ -98,17 +98,39 @@ magpie/ZCode 看到的就是标准 Chat Completions 语义, 逐项对照:
 
 | 能力 | 状态 | 说明 |
 |---|---|---|
-| 流式 / 非流式 | ✅ | chunk 形状与 finish_reason(stop / tool_calls / length)与官方语义一致 |
-| tools / tool_calls | ✅ | 提示词协议模拟; tool_choice 的 auto / none / required / 指定函数 都有处理 |
-| usage | ⚠️ 估算 | 清言不返回 token 数, 按 CJK 1 字≈1 token、其余 4 字符≈1 token 估; prompt 按客户端完整上下文计账, 思考单独计入 reasoning_tokens |
+| 流式 / 非流式 | ✅ | 默认非流式(仅 `stream:true` 走 SSE, 与 OpenAI 一致); chunk 形状与 finish_reason(stop / tool_calls / length)与官方语义一致 |
+| tools / tool_calls | ✅ | 提示词协议模拟; tool_choice 的 auto / none / required / 指定函数 都有处理; 出站只放行「名字在声明列表内 + arguments 合法 JSON + 参数过 schema」的调用 |
+| usage | ⚠️ 估算 | 清言不返回 token 数, 按 CJK 1 字≈1 token、其余 4 字符≈1 token 估; prompt 按客户端完整上下文计账, 思考单独计入 reasoning_tokens; 流式 usage 尾块仅当请求带 `stream_options.include_usage:true` 时输出, 且排在 `[DONE]` 之前 |
 | reasoning_content | ✅ | 思考增量透传成 delta.reasoning_content |
 | 采样参数 | ❌ 收下忽略 | temperature / top_p / seed / max_tokens 网页版不暴露, 不生效 |
+
+### 回合终态与错误语义
+
+一轮对话有且只有一个权威终态(`ROUND.*`),`end()` 时一次性判定、之后不再改,不再靠布尔组合猜。**只有 `completed` 算成功**:
+
+| 终态 | 触发 | 非流式 | 流式(已开始) |
+|---|---|---|---|
+| `completed` | 事件级 `status:finish` | `chat.completion`(stop / tool_calls / length) | chunk + finish_reason + `[DONE]` |
+| `upstream_error` | `status:error` / `status:intervene` / `last_error` | HTTP 502 + OpenAI 错误体 | 流内 `{error}` 帧 + 关闭,**不发 `[DONE]`** |
+| `interrupted` | `reader.read()` 抛异常 | 502 + 错误体(code `stream_interrupted`) | 流内 error 帧,不发 `[DONE]` |
+| `incomplete` | EOF 但没收到完成帧 | 502 + 错误体(code `stream_incomplete`) | 流内 error 帧,不发 `[DONE]` |
+| `truncated` | 输出超上限主动掐断 | `finish_reason:length` | chunk… + length + `[DONE]` |
+| `cancelled` | 调用方 abort / 下游断开 | 499(code `cancelled`) | 流关闭,不发 `[DONE]`、不提交会话 |
+
+要点:
+- **错误不会被伪装成成功**:上游 `error`/`intervene`、读流异常、没有完成帧的 EOF,既不返回 `chat.completion`,也不发代表正常结束的 `[DONE]`;这些情况下**不会**返回 `tool_calls`(哪怕正文里有半截 JSON)。
+- **会话前缀只在 `completed` 时提交**:失败/中断/取消/截断都不记 `conversation_id → 已发前缀`,下一条请求会保守地重开会话,而不是把半截上下文当成功复用。
+- **取消即终止**:abort 后延迟重试、空转续写全部停,上游 fetch/reader/心跳定时器随之释放;已产生部分输出后**不会**重放整轮。
+- **区分三个 finish**:清言**事件级** `status:finish`(回合完成) ≠ part 的 `status:finish`(该 part 全量快照) ≠ 下游 OpenAI 的 `[DONE]`(流结束标记)。只有第一个算上游正常完成。
+
+> ⚠️ 流内错误的已知兼容限制:HTTP 200 的 SSE 一旦开始就无法再改状态码,插件采用「流内 `data:{error}` + 直接关闭、不发 `[DONE]`」的策略(与 OpenAI 官方流式错误同形)。绝大多数 OpenAI 兼容客户端能识别;只做「见到 `[DONE]` 才算成功、否则当断线重连」的字面型客户端可能把这次断开当异常结束而非明确报错 —— 但它至少**不会**被误导成「回答成功完成」。`npm run test:live` 用真实清言验证正常路径,错误路径由 `test-terminal.mjs` 用 mock 流确定性覆盖。
+
 
 ## 已知限制
 
 - **工具调用是模拟的**: 可靠性取决于模型守不守协议。实测 GLM-5.3 / GLM-Flash 在 agent 循环里能稳定给出调用,但参数很复杂或描述含糊时仍可能解析失败;模型偶尔会把自己的调用"演"成文本。
-- **引导语空转**: 模型有时只写一句「继续,三处编辑一次做完:」就结束这一轮,既不给调用也不给结论。插件会判定为空转并自动续写一轮(注入 `TOOL_NUDGE` 提示),仍不奏效时这一轮就只剩那句引导语 —— 再点一次「继续」通常就好了。
-- **模型退化时会狂吐**: 实测出现过一次输出原地打转(上万帧、五十多万字)后上游直接报 `status: error`。插件会在 30 万字处截断并当错误收尾,不会再无限收下去。
+- **引导语空转**: 模型有时只写一句「继续,三处编辑一次做完:」就结束这一轮,既不给调用也不给结论。插件会判定为空转并自动续写一轮(注入 `TOOL_NUDGE` 提示),仍不奏效时这一轮就只剩那句引导语 —— 再点一次「继续」通常就好了。已出错误终态(上游 error/断流/取消)的回合**不会**触发续写,防止把半截输出重放成双份。
+- **模型退化时会狂吐**: 实测出现过一次输出原地打转(上万帧、五十多万字)后上游直接报 `status: error`。插件会在 30 万字处截断,按 OpenAI 截断语义报 `finish_reason: length`(非流式 200 + length;流式 chunk + length + `[DONE]`),不会伪装成自然完成,该轮会话前缀也不提交。
 - **会话映射是进程内内存态**: magpie 重启后历史会被"内联兜底"重放一次(质量略降但可用)。指纹按发出去的回合算,同一会话内复用;换了系统提示或历史被压缩会重开会话。
 - **专属 profile 每次都要登录**: 浏览器授权用的是插件自己的干净 profile,不共享你日常浏览器的登录态——这是安全设计。
 - **风控**: 请求过密会被清言返回滑块 HTML,usage 卡片会显示"风控限流中";建议保持 `maxConcurrency ≤ 2`。
@@ -127,9 +149,11 @@ magpie/ZCode 看到的就是标准 Chat Completions 语义, 逐项对照:
 ## 测试
 
 ```bash
-npm test              # 纯逻辑, 不联网: 工具调用解析/流式组装/会话复用 + 登录流程判定
+npm test              # 纯逻辑, 不联网: 工具调用解析/流式组装/会话复用 + 终态回归(mock fetch/SSE) + 登录流程判定
 npm run test:live     # 联网冒烟(用本机 magpie 已登录的账号, 会消耗少量积分)
 ```
+
+`test-terminal.mjs` 用 mock 的 `fetch`/`Response`/`ReadableStream` 确定性复现全部失败场景(上游 error/intervene、读流异常、无完成帧 EOF、半截断流、错误态工具 JSON、取消不重试、stream 三态、usage 门控、会话只在成功时提交),每次 `npm test` 都跑,不消耗积分。
 
 `npm run test:live` 会走一遍: 带工具的请求 → 应回 `tool_calls`(不能漏 JSON 到正文)→ 回填工具结果 → 应复用会话并给出最终回答 → 普通对话回归。
 

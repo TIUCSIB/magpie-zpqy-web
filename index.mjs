@@ -434,6 +434,74 @@ function browserFlow(log, opts = {}) {
   }
 }
 
+// ---- 回合终态 -----------------------------------------------------------------------
+// 一轮模型回合的权威终态, end() 时一次性判定、判定后不再改。「成功」只认 completed。
+// 旧实现靠 finished/roundDone/error 布尔组合猜终态, 猜错的代价就是事故形态:
+// error 也发 stop、EOF 没完成也算收完、中断的半截调用被当成功工具交给 Agent。
+const ROUND = {
+  COMPLETED: "completed",            // 收到事件级 status:finish, 上游正常完成本回合
+  UPSTREAM_ERROR: "upstream_error",  // 上游明确失败: status:error / status:intervene / last_error
+  INTERRUPTED: "interrupted",        // 读网络流抛出异常(传输故障)
+  INCOMPLETE: "incomplete",          // 连接关闭(正常 EOF)但没有正常完成事件
+  TRUNCATED: "truncated",            // 插件主动掐断(退化输出超上限)
+  CANCELLED: "cancelled",            // 调用方取消(signal abort / 下游断开)
+}
+// 失败终态的人话说明(非流式错误体与流式错误帧共用)
+const ROUND_UNFINISHED = {
+  [ROUND.INTERRUPTED]: "与清言的连接中断, 本轮未完成",
+  [ROUND.INCOMPLETE]: "清言连接已关闭, 但未收到本轮完成信号",
+  [ROUND.CANCELLED]: "请求已取消",
+}
+
+// 工具调用合法校验: 名字在本次声明列表 + arguments 是合法 JSON + 参数匹配 schema。
+// 返回 '' = 合法, 否则返回不合法原因(出站只放行合法调用, 不合法的丢弃并记录)。
+function checkToolCall(c, tools) {
+  const name = c?.function?.name
+  if (typeof name !== "string" || !name) return "调用缺少工具名"
+  const decl = tools.find((t) => t.function?.name === name)
+  if (!decl) return `工具 ${name} 不在本次声明的工具列表里`
+  let args
+  try { args = JSON.parse(c.function.arguments) } catch { return `工具 ${name} 的 arguments 不是合法 JSON` }
+  const errs = schemaErrors(decl.function.parameters, args, `工具 ${name} 的参数`)
+  return errs.length ? errs.join("; ") : ""
+}
+
+// 轻量 JSON Schema 校验(够 OpenAI 工具参数用): type/required/properties/enum/items/
+// additionalProperties:false。不认识的字段一律放行(模型爱补默认值, 误杀比漏放贵)。
+const jsonTypeName = (v) =>
+  Array.isArray(v) ? "array" : v === null ? "null"
+  : typeof v === "number" && Number.isInteger(v) ? "integer" : typeof v
+function typeOk(t, v) {
+  switch (t) {
+    case "object": return !!v && typeof v === "object" && !Array.isArray(v)
+    case "array": return Array.isArray(v)
+    case "string": return typeof v === "string"
+    case "number": return typeof v === "number" && !Number.isNaN(v)
+    case "integer": return Number.isInteger(v)
+    case "boolean": return typeof v === "boolean"
+    case "null": return v === null
+    default: return true // unknown schema type: don't reject on it
+  }
+}
+function schemaErrors(schema, v, at = "参数", out = []) {
+  if (!schema || typeof schema !== "object" || out.length > 12) return out
+  const ts = Array.isArray(schema.type) ? schema.type : schema.type ? [schema.type] : []
+  if (ts.length && !ts.some((t) => typeOk(t, v))) out.push(`${at}: 应为 ${ts.join("/")} 类型, 实际为 ${jsonTypeName(v)}`)
+  if (Array.isArray(schema.enum) && !schema.enum.some((e) => JSON.stringify(e) === JSON.stringify(v)))
+    out.push(`${at}: 取值 ${JSON.stringify(v)} 不在枚举 ${JSON.stringify(schema.enum)} 内`)
+  if (v && typeof v === "object" && !Array.isArray(v)) {
+    for (const k of Array.isArray(schema.required) ? schema.required : [])
+      if (!(k in v)) out.push(`${at}.${k}: 缺少必填参数`)
+    for (const [k, sub] of Object.entries(schema.properties || {}))
+      if (k in v) schemaErrors(sub, v[k], `${at}.${k}`, out)
+    if (schema.additionalProperties === false)
+      for (const k of Object.keys(v))
+        if (!(k in (schema.properties || {}))) out.push(`${at}.${k}: schema 未声明的多余参数`)
+  }
+  if (Array.isArray(v) && schema.items) v.slice(0, 20).forEach((x, i) => schemaErrors(schema.items, x, `${at}[${i}]`, out))
+  return out
+}
+
 // ---- OpenAI <-> 清言 ----------------------------------------------------------------
 
 const textOf = (content) =>
@@ -870,6 +938,11 @@ class ChatglmSSE {
     this.intervene = ""
     this.calls = null // 解析出的工具调用(非流式路径要用)
     this._started = false
+    // ---- 终态 ----
+    this.round = null // ROUND.*, end() 时一次性判定(权威); 判定后不再改
+    this.upstreamFinish = false // 收到过事件级 status:finish(上游正常完成的唯一信号)
+    this.outError = null // end() 判定为失败终态时, 由调用方翻成 HTTP 错误体或流内错误帧
+    this.parseErrors = 0 // 单帧 JSON.parse 失败计数(与传输错误分开统计)
   }
 
   // 同一会话内再发一轮前调用: 解析只看这一轮的输出, 已发出的正文不回滚
@@ -878,6 +951,21 @@ class ChatglmSSE {
     this.roundDone = false
     this.raw = ""
     this.mode = this.tools.length ? "probe" : "text"
+    this.upstreamFinish = false
+    this.error = null
+    this.intervene = ""
+    this.round = null
+    this.outError = null
+  }
+
+  // 外部(pump/handler)记终态: 只在尚未定局时生效, 已定局的失败不被后来的 EOF「洗白」
+  markRound(status, detail) {
+    if (this.round) return
+    this.round = status
+    if (status === ROUND.UPSTREAM_ERROR) this.error = detail || this.error || "上游返回错误"
+    if (status === ROUND.INTERRUPTED) this.outError = { message: detail || ROUND_UNFINISHED[status], code: "stream_interrupted" }
+    if (status === ROUND.INCOMPLETE) this.outError = { message: ROUND_UNFINISHED[status], code: "stream_incomplete" }
+    if (status === ROUND.CANCELLED) this.outError = { message: ROUND_UNFINISHED[status], code: "cancelled" }
   }
 
   emit(delta, finish) {
@@ -901,8 +989,14 @@ class ChatglmSSE {
     // 否则 holdEnd 下等不到 finish 帧, 空了会一直挂到连接关闭, 甚至被误判成空转再补一轮。
     if (evt.status === "error" && !this.error) this.error = le?.intervene_text || "上游返回 error"
     if (evt.status === "intervene") this.intervene = le?.intervene_text || this.error || "内容因合规限制被拦截"
+    // 事件级 status:finish 是「上游回合完成」的信号; 别和 part 的 status:finish(单 part 全量)
+    // 以及下游 OpenAI 流结束标记混为一谈 —— 只有事件级的才算。
+    if (evt.status === "finish") this.upstreamFinish = true
     for (const p of evt.parts || []) this.feedPart(p)
     if (evt.status === "finish" || evt.status === "intervene" || evt.status === "error") {
+      // 上游明确错误/拦截: 先记终态再终结, error 帧里的内容不算成功回合
+      if (evt.status === "error" || evt.status === "intervene")
+        this.markRound(ROUND.UPSTREAM_ERROR, evt.status === "intervene" ? this.intervene : this.error)
       // holdEnd: 只有正常 finish 才可能续写; error/intervene 一律终结
       if (this.holdEnd && evt.status === "finish") this.roundDone = true
       else this.end()
@@ -959,7 +1053,28 @@ class ChatglmSSE {
     if (this.finished) return
     this.finished = true
     if (this.buf) { const b = this.buf; this.buf = ""; this.emitContent(b) }
-    const parsed = this.tools.length ? parseToolCalls(this.raw) : null
+    // 一次性定终态: 已记的失败优先; 否则见到过 finish 帧 = 完成; 什么都没有 = 不完整
+    if (!this.round) {
+      if (this.truncated) this.markRound(ROUND.TRUNCATED)
+      else if (this.error || this.intervene) this.markRound(ROUND.UPSTREAM_ERROR, this.intervene || this.error)
+      else if (this.upstreamFinish) this.markRound(ROUND.COMPLETED)
+      else this.markRound(ROUND.INCOMPLETE)
+    }
+    const ok = this.round === ROUND.COMPLETED || this.round === ROUND.TRUNCATED
+    // 上游错误/中断/不完整: 绝不当成功工具调用返回。只在完全没正文时补一句错误说明,
+    // 已有正文(半截输出)就保留原样 —— 终态判定看 round, 不是搜正文里有没有「错误」。
+    if (this.round === ROUND.UPSTREAM_ERROR) {
+      const note = this.intervene || this.error
+      if (note && !this.text) this.emitContent(`[chatglm] ${note}`)
+      this.outError = { message: note || "上游返回错误", code: this.intervene ? "content_intervene" : "upstream_error" }
+      return // 不发 finish_reason、不发 [DONE: 由调用方按 outError 收尾
+    }
+    if (!ok) {
+      if (!this.text && !this.think) this.emitContent(`[chatglm] ${ROUND_UNFINISHED[this.round] || "本轮未完成"}`)
+      return
+    }
+    // 只有正常完成才走工具调用路径; 截断/错误/中断/不完整的输出绝不伪装成合法调用
+    const parsed = this.tools.length && this.round === ROUND.COMPLETED ? parseToolCalls(this.raw) : null
     let calls = parsed?.calls ?? []
     // 原样重发刚报错的调用: 混在新调用里就只丢重发的, 新调用照常执行;
     // 整轮都是重发则放行(续写轮只有一次, 已在 handler 里给过机会, 客户端每轮上限兜底)
@@ -968,14 +1083,23 @@ class ChatglmSSE {
       if (kept.length) calls = kept
     }
     if (calls.length) {
+      // 校验: 名字在声明列表内、arguments 合法 JSON、参数过 schema。
+      // 不合法的调用不能塞给 Agent(执行侧必炸), 把原始 JSON 当正文放行、按普通文本回答收尾。
+      const bad = calls.map((c) => checkToolCall(c, this.tools)).find(Boolean)
+      if (bad) {
+        // 把「没被放行的原始调用」拼回正文, 让用户/Agent 看得见发生了什么, 而不是凭空少一段
+        const rest = this.raw.startsWith(this.text) ? this.raw.slice(this.text.length).trim() : this.raw.trim()
+        if (rest) this.emitContent((this.text ? '\n' : '') + rest)
+        return this.emit({}, "stop")
+      }
       // 整个 tool_calls 一次性给出(与 HelloGML 同策略: 解析要等正文收完才准)
       calls.forEach((c, i) => this.emit({ tool_calls: [{ index: i, id: c.id, type: "function", function: { name: c.function.name, arguments: c.function.arguments } }] }))
       this.calls = calls
       return this.emit({}, "tool_calls")
     }
+    // 正常完成没有调用: 普通文本路径。被截断的报 length, 自然收尾报 stop。
     const note = this.intervene || this.error
     if (note && !this.text) this.emitContent(`[chatglm] ${note}`)
-    // OpenAI 语义: 被掐断的输出报 length, 正常收尾才是 stop
     this.emit({}, this.truncated ? "length" : "stop")
   }
 }
@@ -1134,22 +1258,42 @@ export async function ChatglmAuthPlugin({ client }) {
               messages: [{ role: "user", content: [{ type: "text", text }] }],
             })
 
+            // 取消状态: 调用方 abort(signal) 与下游断开(cancel()) 都收敛到这里。
+            // 一旦置位, 延迟重试、空转续写、会话提交全部停止; 上游 fetch/reader/定时器随之释放。
+            // sse 要先于取消桥接创建(同步 abort 路径会立刻调 onCancel)。
+            const sse = new ChatglmSSE(model, { tools, blockedCalls: req.blocked })
+            sse.holdEnd = true // finish 帧只标记回合结束; 空转/重发时还要补一轮
+            const ctrl = new AbortController()
+            let cancelled = false
+            const onCancel = () => {
+              if (cancelled) return
+              cancelled = true
+              sse.markRound(ROUND.CANCELLED)
+              try { ctrl.abort() } catch {}
+            }
+            if (opts.signal) {
+              if (opts.signal.aborted) onCancel()
+              else opts.signal.addEventListener("abort", onCancel, { once: true })
+            }
+
             // 一轮 = 一次上游流; 空转续写会再发一轮, 复用同一 conversation_id
             const startRound = async (text, convId) => {
               let res = null
               let err = null
               for (let attempt = 0; attempt < 2; attempt++) {
+                if (cancelled) { const e = new Error("请求已取消"); e.cancelled = true; throw e }
                 try {
                   res = await fetch(`${HOST}/chatglm/backend-api/assistant/stream`, {
                     method: "POST",
                     headers: signedHeaders({ device: c.device, token: c.token, json: true, sse: true }),
                     body: glmBody(text, convId),
-                    signal: opts.signal,
+                    signal: ctrl.signal,
                   })
                 } catch (e) {
                   err = e
                   res = null
                 }
+                if (cancelled) { const e = new Error("请求已取消"); e.cancelled = true; throw e }
                 // 只重试「没建起来」的请求: 流已经开始就不能重来(会双份输出)
                 if (res?.ok) {
                   // 风控/改版页也是 200: content-type 不是 SSE 就别当流收, 否则零输出会被误判成空转、白烧一轮续写
@@ -1164,7 +1308,7 @@ export async function ChatglmAuthPlugin({ client }) {
                   break
                 }
                 if (res && res.status < 500) break
-                if (attempt === 0) await new Promise((r) => setTimeout(r, 1200))
+                if (attempt === 0 && !cancelled) await sleep(1200)
               }
               if (!res) {
                 log(`stream fetch failed: ${err?.message ?? err}`)
@@ -1180,7 +1324,7 @@ export async function ChatglmAuthPlugin({ client }) {
             }
 
             const errorResponse = (e) => new Response(
-              JSON.stringify({ error: { message: String(e?.message ?? e), type: "server_error", param: null, code: e?.status ? String(e.status) : "upstream_error" } }),
+              JSON.stringify({ error: { message: String(e?.message ?? e), type: "server_error", param: null, code: e?.code || (e?.status ? String(e.status) : "upstream_error") } }),
               { status: e?.status ?? 502, headers: { "content-type": "application/json", "x-magpie-sign-in": e?.signIn || "kept" } },
             )
 
@@ -1188,13 +1332,14 @@ export async function ChatglmAuthPlugin({ client }) {
             try {
               first = await startRound(req.text, req.conv)
             } catch (e) {
-              if (e?.status) return errorResponse(e)
+              // 建流阶段的失败(HTTP/网络/取消)统一成 OpenAI 风格错误体: 抛出去只能落到网关的兜底文案,
+              // 客户端无法区分「被取消」与「服务端炸了」
+              if (e?.cancelled) return errorResponse({ status: 499, message: "请求已取消", code: "cancelled" })
+              if (e?.status || e?.message) return errorResponse(e)
               throw e
             }
 
             const keepHeaders = { "content-type": "text/event-stream; charset=utf-8", "cache-control": "no-cache", "x-magpie-sign-in": "kept" }
-            const sse = new ChatglmSSE(model, { tools, blockedCalls: req.blocked })
-            sse.holdEnd = true // finish 帧只标记回合结束; 空转/重发时还要补一轮
 
             // 清言不返回 usage → 估算, 否则网关按 0 记账显示「还没用过」。
             // prompt 按客户端完整上下文估(系统提示+全部历史+工具清单), 不能按 req.text:
@@ -1208,37 +1353,57 @@ export async function ChatglmAuthPlugin({ client }) {
               completion_tokens_details: { reasoning_tokens: estimateTokens(sse.think) },
             })
 
-            // 一轮的 SSE 流进 sse; 回合结束(roundDone)就停, 不等连接关闭
+            // 一轮的 SSE 流进 sse; 回合结束(roundDone)就停, 不等连接关闭。
+            // 读流异常记 interrupted、正常 EOF 但没完成事件记 incomplete —— 不再静默收尾。
             const pump = async (res) => {
               const reader = res.body.getReader()
               const dec = new TextDecoder()
               let buf = ""
-              try {
-                while (true) {
-                  const { value, done } = await reader.read()
-                  if (done) break
-                  buf += dec.decode(value, { stream: true })
-                  let i
-                  while ((i = buf.indexOf("\n")) >= 0) {
-                    const line = buf.slice(0, i).replace(/\r$/, "")
-                    buf = buf.slice(i + 1)
-                    if (line.startsWith("data:")) {
-                      if (DEBUG) log(`sse <- ${line.slice(5, 410)}`)
-                      try { sse.feed(JSON.parse(line.slice(5).trim())) } catch {}
-                    }
+              while (true) {
+                let value, done
+                try {
+                  ;({ value, done } = await reader.read())
+                } catch (e) {
+                  if (cancelled || e?.name === "AbortError") { sse.markRound(ROUND.CANCELLED) }
+                  else {
+                    log(`stream read failed: ${e?.message ?? e}`)
+                    sse.markRound(ROUND.INTERRUPTED, `读取上游流失败: ${e?.message ?? e}`)
                   }
-                  // 退化输出(payload 原地打转)只收前一段就掐掉, 免得把网关和界面一起拖死
-                  if (sse.raw.length + sse.think.length > MAX_OUTPUT_CHARS) {
-                    sse.error = sse.error || `输出异常膨胀(${sse.raw.length + sse.think.length} 字), 已截断`
-                    sse.truncated = true
-                    reader.cancel().catch(() => {})
-                    sse.end()
-                    return
-                  }
-                  if (sse.roundDone || sse.finished) { reader.cancel().catch(() => {}); return }
+                  try { reader.cancel().catch(() => {}) } catch {} // 尽力释放, 不 await(已损坏的 reader cancel 可能挂起/拒绝)
+                  return
                 }
-              } catch (e) {
-                log(`stream failed: ${e?.message ?? e}`)
+                if (done) break
+                buf += dec.decode(value, { stream: true })
+                let i
+                while ((i = buf.indexOf("\n")) >= 0) {
+                  const line = buf.slice(0, i).replace(/\r$/, "")
+                  buf = buf.slice(i + 1)
+                  if (line.startsWith("data:")) {
+                    if (DEBUG) log(`sse <- ${line.slice(5, 410)}`)
+                    let evt = null
+                    try { evt = JSON.parse(line.slice(5).trim()) } catch (e) {
+                      // 单帧解析失败 ≠ 网络失败: 计数并留样本, 继续读后面的帧
+                      if (sse.parseErrors++ < 3) log(`sse frame parse failed x${sse.parseErrors}: ${line.slice(5, 160)}`)
+                      continue
+                    }
+                    sse.feed(evt)
+                  }
+                }
+                if (cancelled) break
+                // 退化输出(payload 原地打转)只收前一段就掐掉, 免得把网关和界面一起拖死
+                if (sse.raw.length + sse.think.length > MAX_OUTPUT_CHARS) {
+                  sse.truncated = true
+                  sse.markRound(ROUND.TRUNCATED)
+                  try { await reader.cancel() } catch {}
+                  sse.end()
+                  return
+                }
+                if (sse.roundDone || sse.finished) { try { await reader.cancel() } catch {} ; return }
+              }
+              // EOF(连接正常关闭): 没有正常完成事件就是 incomplete, 不当成功收尾
+              if (!sse.finished) {
+                if (!cancelled) sse.markRound(ROUND.INCOMPLETE)
+                sse.end()
               }
             }
 
@@ -1246,8 +1411,10 @@ export async function ChatglmAuthPlugin({ client }) {
             // 注意: 不能用 sse.calls —— 它在 end() 里才赋值, 而 holdEnd 下 end() 还没跑
             let retried = false
             const stalledRound = () => {
-              if (retried) return false
-              if (sse.error && !sse.roundDone) return false // 上游报错/断了: 续写只会再撞一次
+              if (retried || cancelled) return false
+              // 已出终态(上游报错/中断/截断/不完整)就不自动续写 —— 错误轮续写只会再撞一次,
+              // 还可能把半截输出重放成整轮双份
+              if (sse.finished || (sse.round && sse.round !== ROUND.COMPLETED)) return false
               if (parseToolCalls(sse.raw)?.calls?.length) return false // 这一轮已经拿到调用, 不算空转
               if ((sse.text || "").trim().length > STALL_MAX_LEN) return false
               // 工具 JSON 写到一半: 原文里已经有调用痕迹, 解析却没成 → 让它重写一遍
@@ -1256,8 +1423,8 @@ export async function ChatglmAuthPlugin({ client }) {
             // 整轮都是「原样重发刚报错的调用」→ 补一轮点名提醒(与空转共用每请求一次的预算),
             // 续写后仍重发就放行, 由客户端的每轮调用上限兜底
             const repeatStalled = () => {
-              if (retried || sse.repeatNudged) return false
-              if (sse.finished || (sse.error && !sse.roundDone)) return false
+              if (retried || sse.repeatNudged || cancelled) return false
+              if (sse.finished || (sse.round && sse.round !== ROUND.COMPLETED)) return false
               if (!req.blocked?.size) return false
               const calls = parseToolCalls(sse.raw)?.calls ?? []
               if (!calls.length || !calls.every((c) => req.blocked.has(callKey(c.function?.name || c?.name, c.function?.arguments)))) return false
@@ -1272,20 +1439,30 @@ export async function ChatglmAuthPlugin({ client }) {
                 res = await startRound(nudge, sse.conv || req.conv)
               } catch (e) {
                 log(`nudge round failed: ${e?.message ?? e}`)
+                // 续写轮没发出去: 保留首轮结果由 end() 定终态
+                // (首轮已收到 finish 帧就是完成回合, 不能被续写失败倒扣成 interrupted)
                 return
               }
               sse.beginRound()
               await pump(res)
             }
 
-            if (openai.stream === false) {
+            // OpenAI 语义: 默认非流式, 只有显式 stream===true 才流式(个别网关会传字符串 'true')
+            const isStream = openai.stream === true || openai.stream === 'true'
+            if (!isStream) {
               // 非流式: 聚合后回一个 chat.completion
               await pump(first)
               if (stalledRound()) await retryRound()
               else if (repeatStalled()) await retryRound(TOOL_NUDGE_REPEAT)
-              if (sse.conv) remember(sse.conv, req.sig)
-              // 不跑 end() 的话 sse.calls 恒空、缓冲正文也不放行 —— 非流式工具调用全废(0.3.0 修过又随回滚丢失, 单独重落)
               if (!sse.finished) sse.end()
+              // 只有确认正常完成的回合才提交会话前缀; 成功产出合法工具调用也算完成
+              if (sse.round === ROUND.COMPLETED && sse.conv) remember(sse.conv, req.sig)
+              // 失败终态不能伪装成成功的 chat.completion: 返回 OpenAI 风格错误体
+              if (sse.outError) {
+                const status = sse.round === ROUND.CANCELLED ? 499 : 502
+                return errorResponse({ status, message: sse.outError.message, code: sse.outError.code, signIn: "kept" })
+              }
+              if (DEBUG) log(`chat -> conv=${sse.conv || "?"} round=${sse.round} text=${sse.text.length}ch think=${sse.think.length}ch calls=${sse.calls?.length ?? 0}`)
               const msg = sse.calls
                 ? { role: "assistant", content: sse.text || null, tool_calls: sse.calls }
                 : { role: "assistant", content: sse.text || `[chatglm] 空回复${sse.error ? `: ${sse.error}` : ""}` }
@@ -1297,24 +1474,42 @@ export async function ChatglmAuthPlugin({ client }) {
             }
 
             // 流式: 清言 SSE → OpenAI chunk
+            const wantUsage = openai.stream_options?.include_usage === true
             const enc = new TextEncoder()
+            const sseData = (obj) => enc.encode("data: " + JSON.stringify(obj) + "\n\n")
+            let ping = null
             const out = new ReadableStream({
-              async start(ctrl) {
-                sse.onChunk = (chunk) => ctrl.enqueue(enc.encode("data: " + JSON.stringify(chunk) + "\n\n"))
+              async start(sink) {
+                sse.onChunk = (chunk) => { try { sink.enqueue(sseData(chunk)) } catch {} }
                 // 心跳: deep_thinking 首字可 70s+, 中间层普遍 60-120s 空闲就掐; SSE 注释帧按规范被客户端忽略
-                const ping = setInterval(() => { try { ctrl.enqueue(enc.encode(": ping\n\n")) } catch { clearInterval(ping) } }, 15000)
+                ping = setInterval(() => { try { sink.enqueue(enc.encode(": ping\n\n")) } catch { clearInterval(ping) } }, 15000)
                 try {
                   await pump(first)
                   if (stalledRound()) await retryRound()
                   else if (repeatStalled()) await retryRound(TOOL_NUDGE_REPEAT)
-                } finally { clearInterval(ping) }
-                if (sse.conv) remember(sse.conv, req.sig)
-                if (DEBUG) log(`chat -> conv=${sse.conv || "?"} text=${sse.text.length}ch think=${sse.think.length}ch calls=${sse.calls?.length ?? 0}${sse.error ? ` err=${sse.error}` : ""}`)
+                } finally { clearInterval(ping); ping = null }
                 if (!sse.finished) sse.end()
-                // 标准 OpenAI 流式 usage 尾块(choices 空)
-                ctrl.enqueue(enc.encode("data: " + JSON.stringify({ id: sse.id, object: "chat.completion.chunk", created: Math.floor(Date.now() / 1000), model: sse.model, choices: [], usage: usageEstimate() }) + "\n\n"))
-                ctrl.enqueue(enc.encode("data: [DONE]\n\n"))
-                ctrl.close()
+                if (sse.round === ROUND.COMPLETED && sse.conv) remember(sse.conv, req.sig)
+                if (DEBUG) log(`chat -> conv=${sse.conv || "?"} round=${sse.round} text=${sse.text.length}ch think=${sse.think.length}ch calls=${sse.calls?.length ?? 0}${sse.error ? ` err=${sse.error}` : ""}`)
+                try {
+                  // 失败终态: 流内错误帧 + 关闭, 不发 [DONE] —— OpenAI 官方流式错误同此形态(HTTP 200 后 data 里带 error)。
+                  // 已知限制: 个别只做「[DONE]=成功」字面判断的客户端可能仍把这次断开当结束; 但无 finish_reason + error 帧 + 无 [DONE],
+                  // 已是纯 SSE 通道下能选的最可区分的方案(见 README「流内错误」)。
+                  if (sse.outError) {
+                    sink.enqueue(sseData({ error: { message: sse.outError.message, type: "server_error", param: null, code: sse.outError.code } }))
+                    sink.close()
+                    return
+                  }
+                  // 标准 OpenAI 流式 usage 尾块(choices 空), 仅客户端显式 stream_options.include_usage 时输出
+                  if (wantUsage) sink.enqueue(sseData({ id: sse.id, object: "chat.completion.chunk", created: Math.floor(Date.now() / 1000), model: sse.model, choices: [], usage: usageEstimate() }))
+                  sink.enqueue(enc.encode("data: [DONE]\n\n"))
+                  sink.close()
+                } catch {} // 下游已断开: cancel() 已记终态, 这里静默收尾
+              },
+              // 下游取消/断开: 记 cancelled、掐上游 fetch 与心跳, 不再重试与续写
+              cancel() {
+                onCancel()
+                if (ping) { clearInterval(ping); ping = null }
               },
             })
             return new Response(out, { status: 200, headers: keepHeaders })
@@ -1379,5 +1574,6 @@ export const _internal = {
   normalizeTools, parseToolCalls, sliceJsonObject, looseJson, jsonClosed, renderTurn, estimateTokens,
   looksStalled, repairJson, TOOL_NUDGE, TOOL_NUDGE_BROKEN, MAX_OUTPUT_CHARS,
   callKey, failedCallKeys, TOOL_ERR_RE, TOOL_ERR_REMINDER, TOOL_NUDGE_REPEAT,
+  ROUND, ROUND_UNFINISHED, checkToolCall, schemaErrors,
   HOST, SIGN_SALT, ASSISTANT_ID, VARIANTS,
 }
