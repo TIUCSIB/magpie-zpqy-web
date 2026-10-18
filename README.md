@@ -92,6 +92,18 @@ sequenceDiagram
 
 **速度档位**:`低 / 高 / 最高` 对应清言的 快速 / 深度 / 极致(`chat_mode` + `reasoning_effort`)。客户端没选档位时按「低(快速)」发,想要更深的思考在模型设置里挑 `高` / `最高`(实测最慢能到 70s+ 才出正文)。
 
+## OpenAI 兼容面
+
+magpie/ZCode 看到的就是标准 Chat Completions 语义, 逐项对照:
+
+| 能力 | 状态 | 说明 |
+|---|---|---|
+| 流式 / 非流式 | ✅ | chunk 形状与 finish_reason(stop / tool_calls / length)与官方语义一致 |
+| tools / tool_calls | ✅ | 提示词协议模拟; tool_choice 的 auto / none / required / 指定函数 都有处理 |
+| usage | ⚠️ 估算 | 清言不返回 token 数, 按 CJK 1 字≈1 token、其余 4 字符≈1 token 估; prompt 按客户端完整上下文计账, 思考单独计入 reasoning_tokens |
+| reasoning_content | ✅ | 思考增量透传成 delta.reasoning_content |
+| 采样参数 | ❌ 收下忽略 | temperature / top_p / seed / max_tokens 网页版不暴露, 不生效 |
+
 ## 已知限制
 
 - **工具调用是模拟的**: 可靠性取决于模型守不守协议。实测 GLM-5.3 / GLM-Flash 在 agent 循环里能稳定给出调用,但参数很复杂或描述含糊时仍可能解析失败;模型偶尔会把自己的调用"演"成文本。

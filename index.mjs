@@ -888,7 +888,8 @@ class ChatglmSSE {
     }
     const note = this.intervene || this.error
     if (note && !this.text) this.emitContent(`[chatglm] ${note}`)
-    this.emit({}, "stop")
+    // OpenAI 语义: 被掐断的输出报 length, 正常收尾才是 stop
+    this.emit({}, this.truncated ? "length" : "stop")
   }
 }
 
@@ -1014,8 +1015,14 @@ export async function ChatglmAuthPlugin({ client }) {
               return new Response(t, { status: r.status, headers: { "content-type": r.headers.get("content-type") || "application/json", "x-magpie-sign-in": keep } })
             }
 
-            const tools = openai.tool_choice === "none" ? [] : normalizeTools(openai.tools)
+            const tc = openai.tool_choice
+            let tools = tc === "none" ? [] : normalizeTools(openai.tools)
+            // OpenAI 兼容: 指定函数时只把那个函数放进协议, required 时强制本轮必须出调用
+            if (tc && typeof tc === "object" && tc.function?.name) tools = tools.filter((t) => t.function.name === tc.function.name)
             const req = translateRequest(openai, tools)
+            if ((tc === "required" || (tc && typeof tc === "object")) && tools.length) {
+              req.text += `\n\n# 强制\n本轮必须输出 {"tool_calls":[...]} 开始执行, 禁止纯文本回答。${tc?.function?.name ? `使用工具 ${tc.function.name}。` : ""}`
+            }
             // 档位来源: magpie variants 走 reasoning_effort 字段; 也认模型 id 后缀(:high/:max)
             let model = openai.model || "glm-5.3-flash"
             let effort = ""
@@ -1073,7 +1080,7 @@ export async function ChatglmAuthPlugin({ client }) {
             }
 
             const errorResponse = (e) => new Response(
-              JSON.stringify({ error: { message: String(e?.message ?? e), type: "server_error" } }),
+              JSON.stringify({ error: { message: String(e?.message ?? e), type: "server_error", param: null, code: e?.status ? String(e.status) : "upstream_error" } }),
               { status: e?.status ?? 502, headers: { "content-type": "application/json", "x-magpie-sign-in": e?.signIn || "kept" } },
             )
 
@@ -1093,10 +1100,12 @@ export async function ChatglmAuthPlugin({ client }) {
             // prompt 按客户端完整上下文估(系统提示+全部历史+工具清单), 不能按 req.text:
             // 会话复用时增量可能只有「继续」两个字, 用量页会显示 in=2, 被误读成「没消耗」。
             const promptTokens = estimateTokens(req.fullText || req.text)
+            const outTokens = () => estimateTokens(sse.text) + estimateTokens(sse.think)
             const usageEstimate = () => ({
               prompt_tokens: promptTokens,
-              completion_tokens: estimateTokens(sse.text) + estimateTokens(sse.think),
-              total_tokens: promptTokens + estimateTokens(sse.text) + estimateTokens(sse.think),
+              completion_tokens: outTokens(),
+              total_tokens: promptTokens + outTokens(),
+              completion_tokens_details: { reasoning_tokens: estimateTokens(sse.think) },
             })
 
             // 一轮的 SSE 流进 sse; 回合结束(roundDone)就停, 不等连接关闭
@@ -1120,6 +1129,7 @@ export async function ChatglmAuthPlugin({ client }) {
                   // 退化输出(payload 原地打转)只收前一段就掐掉, 免得把网关和界面一起拖死
                   if (sse.raw.length + sse.think.length > MAX_OUTPUT_CHARS) {
                     sse.error = sse.error || `输出异常膨胀(${sse.raw.length + sse.think.length} 字), 已截断`
+                    sse.truncated = true
                     reader.cancel().catch(() => {})
                     sse.end()
                     return
@@ -1166,7 +1176,7 @@ export async function ChatglmAuthPlugin({ client }) {
                 : { role: "assistant", content: sse.text || `[chatglm] 空回复${sse.error ? `: ${sse.error}` : ""}` }
               return new Response(JSON.stringify({
                 id: sse.id, object: "chat.completion", created: Math.floor(Date.now() / 1000), model,
-                choices: [{ index: 0, message: msg, finish_reason: sse.calls ? "tool_calls" : "stop" }],
+                choices: [{ index: 0, message: msg, finish_reason: sse.calls ? "tool_calls" : sse.truncated ? "length" : "stop" }],
                 usage: usageEstimate(),
               }), { status: 200, headers: { "content-type": "application/json", "x-magpie-sign-in": "kept" } })
             }

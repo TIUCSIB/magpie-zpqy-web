@@ -216,5 +216,12 @@ console.log('[17] 退化输出: 超过上限要截断而不是无限收')
 const { MAX_OUTPUT_CHARS } = _internal
 check('上限常量存在且合理', typeof MAX_OUTPUT_CHARS === 'number' && MAX_OUTPUT_CHARS > 100_000, true)
 
+console.log('[18] OpenAI 兼容细节: 截断报 length')
+chunks.length = 0
+const tr = new ChatglmSSE('glm-5.3', { onChunk: (c) => chunks.push(c) })
+tr.truncated = true
+tr.end()
+check('截断的输出 finish_reason=length', chunks.at(-1).choices[0].finish_reason, 'length')
+
 console.log(`\n结果: ${pass} 通过, ${fail} 失败`)
 process.exit(fail ? 1 : 0)
