@@ -1,7 +1,7 @@
 {
   "name": "opencode-chatglm-auth",
-  "version": "0.0.1",
-  "description": "OpenCode/magpie provider plugin: 智谱清言 (chatglm.cn) 网页版接口",
+  "version": "0.1.0",
+  "description": "OpenCode/magpie provider plugin: 智谱清言 (chatglm.cn) 网页版接口, 含提示词协议工具调用",
   "type": "module",
   "main": "./index.mjs",
   "exports": "./index.mjs",
@@ -9,6 +9,10 @@
     "index.mjs",
     "README.md"
   ],
+  "scripts": {
+    "test": "node test-toolcalls.mjs && node test-browserflow.mjs",
+    "test:live": "node test-live.mjs"
+  },
   "keywords": [
     "opencode",
     "opencode-plugin",
@@ -16,7 +20,9 @@
     "chatglm",
     "zhipu",
     "glm",
-    "qingyan"
+    "qingyan",
+    "function-calling",
+    "tool-calling"
   ],
   "license": "MIT",
   "magpie": {
