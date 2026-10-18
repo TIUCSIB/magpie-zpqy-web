@@ -73,7 +73,7 @@
     <!-- plugin core -->
     <g transform="translate(24 150)">
       <rect width="380" height="76" rx="10" fill="#0E1B33" stroke="#3D7BF0" stroke-width="1.5"/>
-      <text x="16" y="24" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', sans-serif" font-size="18" font-weight="600" fill="#9CC4F8">opencode-chatglm-auth</text>
+      <text x="16" y="24" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', sans-serif" font-size="18" font-weight="600" fill="#9CC4F8">magpie-chatglm-auth</text>
       <text x="16" y="48" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="16" fill="#C9A86A">x-sign = md5(ts · nonce · salt)</text>
       <text x="16" y="68" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="15" fill="#6E8DB4">luhn(Date.now()) · uuid32()</text>
     </g>

@@ -1,4 +1,4 @@
-// opencode-chatglm-auth —— 智谱清言 (chatglm.cn) magpie/OpenCode 供应商插件
+// magpie-chatglm-auth —— 智谱清言 (chatglm.cn) magpie/OpenCode 供应商插件
 //
 // 协议(逆向自 chatglm.cn 网页端, 2026-10 实测验证):
 //   x-sign = md5(`${x-timestamp}-${x-nonce}-<salt>`);  x-timestamp 为 Date.now() 做 Luhn
@@ -337,7 +337,7 @@ function browserFlow(log, opts = {}) {
   const start = async () => {
     if (!state.exe) throw new Error("找不到 Chrome/Edge —— 请改用「粘贴 Cookie」方式登录")
     state.port = 9300 + Math.floor(Math.random() * 500)
-    state.profile = path.join(process.env.LOCALAPPDATA || os.homedir(), "opencode-chatglm-auth", "browser")
+    state.profile = path.join(process.env.LOCALAPPDATA || os.homedir(), "magpie-chatglm-auth", "browser")
     fs.mkdirSync(state.profile, { recursive: true })
     state.child = spawn(state.exe, [
       `--remote-debugging-port=${state.port}`,

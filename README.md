@@ -9,7 +9,7 @@
 ## 快速开始
 
 ```bash
-magpie plugin add github:TIUCSIB/magpie-zpqy-web   # 或本地: magpie plugin add ./opencode-chatglm-auth
+magpie plugin add github:TIUCSIB/magpie-zpqy-web   # 或本地: magpie plugin add ./magpie-zpqy-web
 magpie plugin login chatglm                         # 选一种登录方式(见下)
 magpie provider test chatglm                        # 最小请求验证
 ```
