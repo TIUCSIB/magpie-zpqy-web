@@ -148,5 +148,42 @@ s = run([{ status: 'intervene', last_error: { intervene_text: '内容不合规' 
 check('intervene 有回话', /内容不合规/.test(s.text), true)
 check('intervene 也是 stop', chunks.at(-1).choices[0].finish_reason, 'stop')
 
+console.log('[12] 多行代码参数: 模型不转义换行(JSON 非法)也要能解析')
+// 真实失败形态: oldString/newString 里直接换行, JSON.parse 必挂
+const multiline = '{"tool_calls":[{"name":"edit","arguments":{"filePath":"a.ts","oldString":"const x = 1\nreturn x","newString":"const x = 2\nreturn x"}}]}'
+check('裸换行能解析出调用', callsOf(multiline), [['edit', '{"filePath":"a.ts","oldString":"const x = 1\\nreturn x","newString":"const x = 2\\nreturn x"}']])
+check('裸换行不吞掉前置正文', textOf(`继续。三处编辑一次做完：\n${multiline}`), '继续。三处编辑一次做完：')
+check('制表符也能解析', callsOf('{"tool_calls":[{"name":"edit","arguments":{"s":"\tfoo"}}]}'), [['edit', '{"s":"\\tfoo"}']])
+// 字符串里真正的换行保留为 \n, 不能被压成一行
+check('换行语义保留', JSON.parse(callsOf(multiline)[0][1]).oldString, 'const x = 1\nreturn x')
+
+console.log('[13] 空转判定: 只有引导语/半句话 → 该续写')
+const { looksStalled } = _internal
+check('冒号收尾的引导语', looksStalled('继续。三处编辑一次做完（加常量、替换两处硬编码、升版本号）：'), true)
+check('逗号收尾', looksStalled('我先看看目录，'), true)
+check('极短无句号', looksStalled('继续执行'), true)
+check('空输出', looksStalled(''), true)
+check('完整回答不算空转', looksStalled('改好了，共三处：常量、两处引用、版本号。'), false)
+check('英文完整句不算空转', looksStalled('Let me execute. First the edits.'), false)
+check('长正文不算空转', looksStalled('甲'.repeat(300)), false)
+check('写到一半的调用不算空转', looksStalled('{"tool_calls":[{"name":"edit","arguments":{'), false)
+
+console.log('[14] SSE holdEnd: finish 帧只结束回合, 由调用方决定是否续写')
+chunks.length = 0
+const held = new ChatglmSSE('glm-5.3', { tools, onChunk: (c) => chunks.push(c) })
+held.holdEnd = true
+held.feed({ conversation_id: 'cv', status: 'init', parts: [{ logic_id: 'p1', status: 'init', content: [{ type: 'text', text: '继续：' }] }] })
+held.feed({ status: 'finish', parts: [{ logic_id: 'p1', status: 'finish', content: [{ type: 'text', text: '继续：' }] }] })
+check('回合结束但不终结流', held.roundDone && !held.finished, true)
+check('此时没有 finish_reason', chunks.some((c) => c.choices[0].finish_reason), false)
+held.beginRound()
+check('beginRound 清掉上一轮 raw', held.raw, '')
+held.feed({ status: 'init', parts: [{ logic_id: 'p2', status: 'init', content: [{ type: 'text', text: '{"tool_calls":[{"name":"bash","arguments":{"command":"ls"}}]}' }] }] })
+held.feed({ status: 'finish', parts: [{ logic_id: 'p2', status: 'finish', content: [{ type: 'text', text: '{"tool_calls":[{"name":"bash","arguments":{"command":"ls"}}]}' }] }] })
+held.end()
+check('续写轮给出 tool_calls', held.calls?.[0]?.function?.name, 'bash')
+check('两轮正文都保留', held.text, '继续：')
+check('最终 finish_reason=tool_calls', chunks.at(-1).choices[0].finish_reason, 'tool_calls')
+
 console.log(`\n结果: ${pass} 通过, ${fail} 失败`)
 process.exit(fail ? 1 : 0)

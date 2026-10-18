@@ -40,6 +40,11 @@ const FALLBACK_MODELS = [
   { id: "glm-5.3-flash", name: "GLM-Flash" },
 ]
 
+// 网页协议不暴露上限(available_models 里相应字段为 null, 前端 bundle 亦无常量),
+// 按 models.dev 官方目录声明: GLM-5.3 / GLM-5.3-Flash = 1M 上下文 / 131072 输出。
+// 输入侧实测 80 万字不截断; 输出模型自己不肯写长文, 那是网页版习惯, 非协议限制。
+const LIMIT = { context: 1_000_000, output: 131_072 }
+
 // 清言的推理档位(抓包 available_models + 网页选择器): 快速/深度/极致 = ""/thinking/deep_thinking
 // magpie 的 variants 键即档位名, 会渲染成模型设置里那排勾选框; 值必须带 reasoningEffort,
 // 否则网关不会往请求体里放字段(社区插件 opencode-qoder-auth/grok-auth 同此约定)。
@@ -458,6 +463,7 @@ const TOOL_PROTOCOL = (tools) => `# 工具调用协议(必须严格遵守)
 - 不需要工具时用自然语言正常回答, 不要输出这个 JSON。
 - 工具结果会以「工具执行结果」的形式发回给你: 还需要信息就继续按协议调用, 否则给出最终回答。
 - 不要臆造清单外的工具, 也不要把调用写成代码块。
+- 绝对不要只写「继续/我来做/下面开始…」这类引导语就停下: 要么立刻输出上面的 JSON, 要么用完整句子给出最终回答。
 
 ## 可用工具
 ${tools.map((t) => `### ${t.function.name}\n${t.function.description || "(无描述)"}\n参数 schema: ${JSON.stringify(t.function.parameters)}`).join("\n\n")}
@@ -472,6 +478,33 @@ ${tools.map((t) => `### ${t.function.name}\n${t.function.description || "(无描
 // agent 循环里每一轮都提醒一次: 清言侧历史很长, 协议容易被冲淡
 const TOOL_REMINDER = `# 提示
 还需要工具就继续按协议输出 {"tool_calls":[...]};任务已完成就用自然语言给出最终回答。`
+
+// 模型偶尔只写一句引导语(常以冒号结尾)就结束这一轮 —— 清言侧 status=finish, 网关侧看不到任何
+// 工具调用, agent 循环就地停住, 界面上就只剩「…一次做完（加常量、替换两处、升版本）：」。
+// 这一类输出既没给调用也没给结论, 判定为「空转」并补一轮续写。
+const STALL_MAX_LEN = 240
+const STALL_TAIL = /(?:[:：,，、]|\.{2,}|…|——|—|-)\s*$/
+const SENTENCE_END = /[。！？!?~～.”』」）)]\s*$/
+
+function looksStalled(text) {
+  const t = String(text || "").trim()
+  if (!t) return true
+  if (t.length > STALL_MAX_LEN) return false
+  if (TOOL_MARK.test(t)) return false // 写了一半的调用走另一条路径
+  if (STALL_TAIL.test(t)) return true // 冒号/逗号/破折号收尾: 话没说完
+  return !SENTENCE_END.test(t) && t.length <= 120 // 没有句末标点的短句: 多半也只是铺垫
+}
+
+// 续写轮: 把「刚才只说了半句」明确指出来, 要求这一轮给出 JSON 或完整回答
+const TOOL_NUDGE = `# 注意
+你上一条回复只有一句引导语就结束了, 既没有工具调用也不是完整回答。
+这一轮必须二选一: 直接输出 {"tool_calls":[...]} 开始执行, 或者用完整的句子给出最终结论。不要再写引导语。`
+
+// 调用被写坏(JSON 不合规/被截断)时的续写轮: 明确要求重发, 并强调换行必须转义
+const TOOL_NUDGE_BROKEN = `# 注意
+你上一条回复里的工具调用 JSON 不完整或不合法(常见原因: 字符串里直接写了换行, 或输出被截断), 无法执行。
+请重新完整输出一次: 所有参数值都在同一行内, 代码里的换行写成 \\n(反斜杠 + n), 不要用真实换行。
+格式: {"tool_calls":[{"name":"工具名","arguments":{...}}]}`
 
 // 工具定义归一到 OpenAI 形状(顺带吃下 Anthropic 风格的 {name, input_schema})
 function normalizeTools(tools) {
@@ -512,7 +545,7 @@ function sliceJsonObject(str, key) {
   return null
 }
 
-// 把 JS 对象字面量修成 JSON: 裸键补引号、单引号串换双引号、去尾逗号。
+// 把 JS 对象字面量修成 JSON: 裸键补引号、单引号串换双引号、去尾逗号、字符串里的裸换行转义。
 // 只动字符串外的字符, 免得把正文里的冒号/逗号也改了。
 function repairJson(t) {
   let out = "", i = 0, inStr = false
@@ -520,6 +553,11 @@ function repairJson(t) {
     const ch = t[i]
     if (inStr) {
       if (ch === "\\") { out += t.slice(i, i + 2); i += 2; continue }
+      // 模型写多行代码时几乎不会转义换行(它是在「写代码」而不是「写 JSON」),
+      // 裸换行/制表符在 JSON 字符串里非法, 不转义整段就解析失败。
+      if (ch === "\n") { out += "\\n"; i++; continue }
+      if (ch === "\r") { out += "\\r"; i++; continue }
+      if (ch === "\t") { out += "\\t"; i++; continue }
       out += ch
       if (ch === '"') inStr = false
       i++
@@ -738,10 +776,20 @@ class ChatglmSSE {
     this.mode = this.tools.length ? "probe" : "text" // probe: 先缓冲, 看是不是工具调用
     this.buf = ""
     this.finished = false
+    this.roundDone = false
+    this.holdEnd = false // 为 true 时 finish 帧只标记本回合结束, 不终结整条流(空转要续写一轮)
     this.error = null
     this.intervene = ""
     this.calls = null // 解析出的工具调用(非流式路径要用)
     this._started = false
+  }
+
+  // 同一会话内再发一轮前调用: 解析只看这一轮的输出, 已发出的正文不回滚
+  beginRound() {
+    this.roundDone = false
+    this.raw = ""
+    this.mode = this.tools.length ? "probe" : "text"
+    this.buf = ""
   }
 
   emit(delta, finish) {
@@ -763,7 +811,11 @@ class ChatglmSSE {
     if (le && (le.message || le.code)) this.error = String(le.message || le.code)
     if (evt.status === "intervene") this.intervene = le?.intervene_text || this.error || "内容因合规限制被拦截"
     for (const p of evt.parts || []) this.feedPart(p)
-    if (evt.status === "finish" || evt.status === "intervene") this.end()
+    if (evt.status === "finish" || evt.status === "intervene") {
+      // holdEnd: 回合结束先记账不终结, 由调用方决定补不补一轮(空转判定要用到 buf)
+      if (this.holdEnd && evt.status === "finish") this.roundDone = true
+      else this.end()
+    }
   }
 
   feedPart(p) {
@@ -851,7 +903,7 @@ export async function ChatglmAuthPlugin({ client }) {
       const models = Object.fromEntries(
         FALLBACK_MODELS.map((m) => [
           m.id,
-          { name: m.name, limit: { context: 200000, output: 32000 }, tool_call: true, reasoning: true, variants: VARIANTS },
+          { name: m.name, limit: LIMIT, tool_call: true, reasoning: true, variants: VARIANTS },
         ]),
       )
       cfg.provider[PROVIDER] = { npm: "@ai-sdk/openai-compatible", api: HOST, ...was, name: LABEL, models: { ...models, ...(was.models ?? {}) } }
@@ -961,9 +1013,9 @@ export async function ChatglmAuthPlugin({ client }) {
             effort = String(openai.reasoning_effort || openai.reasoningEffort || openai.effort || effort || "").toLowerCase()
             if (!EFFORTS.includes(effort)) effort = DEFAULT_EFFORT
             const mode = EFFORT_TO_META[effort]
-            const glmBody = JSON.stringify({
+            const glmBody = (text, convId) => JSON.stringify({
               assistant_id: ASSISTANT_ID,
-              conversation_id: req.conv,
+              conversation_id: convId,
               project_id: "",
               chat_type: "user_chat",
               meta_data: {
@@ -972,43 +1024,59 @@ export async function ChatglmAuthPlugin({ client }) {
                 chat_mode: mode.chat_mode, reasoning_effort: mode.reasoning_effort,
                 selected_model: model, is_networking: false, quote_log_id: "", platform: "pc",
               },
-              messages: [{ role: "user", content: [{ type: "text", text: req.text }] }],
+              messages: [{ role: "user", content: [{ type: "text", text }] }],
             })
 
-            let res = null
-            let err = null
-            for (let attempt = 0; attempt < 2; attempt++) {
-              try {
-                res = await fetch(`${HOST}/chatglm/backend-api/assistant/stream`, {
-                  method: "POST",
-                  headers: signedHeaders({ device: c.device, token: c.token, json: true, sse: true }),
-                  body: glmBody,
-                  signal: opts.signal,
-                })
-              } catch (e) {
-                err = e
-                res = null
+            // 一轮 = 一次上游流; 空转续写会再发一轮, 复用同一 conversation_id
+            const startRound = async (text, convId) => {
+              let res = null
+              let err = null
+              for (let attempt = 0; attempt < 2; attempt++) {
+                try {
+                  res = await fetch(`${HOST}/chatglm/backend-api/assistant/stream`, {
+                    method: "POST",
+                    headers: signedHeaders({ device: c.device, token: c.token, json: true, sse: true }),
+                    body: glmBody(text, convId),
+                    signal: opts.signal,
+                  })
+                } catch (e) {
+                  err = e
+                  res = null
+                }
+                // 只重试「没建起来」的请求: 流已经开始就不能重来(会双份输出)
+                if (res?.ok) break
+                if (res && res.status < 500) break
+                if (attempt === 0) await new Promise((r) => setTimeout(r, 1200))
               }
-              // 只重试「没建起来」的请求: 流已经开始就不能重来(会双份输出)
-              if (res?.ok) break
-              if (res && res.status < 500) break
-              if (attempt === 0) await new Promise((r) => setTimeout(r, 1200))
-            }
-            if (!res) {
-              log(`stream fetch failed: ${err?.message ?? err}`)
-              throw err
-            }
-
-            if (!res.ok) {
+              if (!res) {
+                log(`stream fetch failed: ${err?.message ?? err}`)
+                throw err
+              }
+              if (res.ok) return res
               const t = await res.text().catch(() => "")
               const expired = res.status === 401 || res.status === 403 || /"status"\s*:\s*400\d\d|40104|未登录/i.test(t)
-              return new Response(JSON.stringify({ error: { message: `chatglm ${res.status}: ${t.slice(0, 200)}`, type: "server_error" } }), {
-                status: res.status,
-                headers: { "content-type": "application/json", "x-magpie-sign-in": expired ? "expired" : "kept" },
-              })
+              const e = new Error(`chatglm ${res.status}: ${t.slice(0, 200)}`)
+              e.status = res.status
+              e.signIn = expired ? "expired" : "kept"
+              throw e
+            }
+
+            const errorResponse = (e) => new Response(
+              JSON.stringify({ error: { message: String(e?.message ?? e), type: "server_error" } }),
+              { status: e?.status ?? 502, headers: { "content-type": "application/json", "x-magpie-sign-in": e?.signIn || "kept" } },
+            )
+
+            let first = null
+            try {
+              first = await startRound(req.text, req.conv)
+            } catch (e) {
+              if (e?.status) return errorResponse(e)
+              throw e
             }
 
             const keepHeaders = { "content-type": "text/event-stream; charset=utf-8", "cache-control": "no-cache", "x-magpie-sign-in": "kept" }
+            const sse = new ChatglmSSE(model, { tools })
+            sse.holdEnd = true // finish 帧只标记回合结束; 空转时还要补一轮
 
             // 清言不返回 usage → 估算, 否则网关按 0 记账显示「还没用过」
             const usageEstimate = () => {
@@ -1017,15 +1085,57 @@ export async function ChatglmAuthPlugin({ client }) {
               return { prompt_tokens: prompt, completion_tokens: completion, total_tokens: prompt + completion }
             }
 
-            const sse = new ChatglmSSE(model, { tools })
+            // 一轮的 SSE 流进 sse; 回合结束(roundDone)就停, 不等连接关闭
+            const pump = async (res) => {
+              const reader = res.body.getReader()
+              const dec = new TextDecoder()
+              let buf = ""
+              try {
+                while (true) {
+                  const { value, done } = await reader.read()
+                  if (done) break
+                  buf += dec.decode(value, { stream: true })
+                  let i
+                  while ((i = buf.indexOf("\n")) >= 0) {
+                    const line = buf.slice(0, i).replace(/\r$/, "")
+                    buf = buf.slice(i + 1)
+                    if (line.startsWith("data:")) {
+                      try { sse.feed(JSON.parse(line.slice(5).trim())) } catch {}
+                    }
+                  }
+                  if (sse.roundDone || sse.finished) { reader.cancel().catch(() => {}); return }
+                }
+              } catch (e) {
+                log(`stream failed: ${e?.message ?? e}`)
+              }
+            }
+
+            // 这一轮没给出工具调用、正文也只是半句引导语 → 补一轮(只补一次)
+            let retried = false
+            const stalledRound = () => {
+              if (retried || sse.calls?.length) return false
+              if ((sse.text || "").trim().length > STALL_MAX_LEN) return false
+              // 工具 JSON 写到一半: 原文里已经有调用痕迹, 解析却没成 → 让它重写一遍
+              return TOOL_MARK.test(sse.raw) ? true : looksStalled(sse.text)
+            }
+            const retryRound = async () => {
+              retried = true
+              const nudge = TOOL_MARK.test(sse.raw) ? TOOL_NUDGE_BROKEN : TOOL_NUDGE
+              let res = null
+              try {
+                res = await startRound(nudge, sse.conv || req.conv)
+              } catch (e) {
+                log(`nudge round failed: ${e?.message ?? e}`)
+                return
+              }
+              sse.beginRound()
+              await pump(res)
+            }
+
             if (openai.stream === false) {
               // 非流式: 聚合后回一个 chat.completion
-              const text = await res.text()
-              for (const line of text.split("\n")) {
-                if (!line.startsWith("data:")) continue
-                try { sse.feed(JSON.parse(line.slice(5).trim())) } catch {}
-                if (sse.finished) break
-              }
+              await pump(first)
+              if (stalledRound()) await retryRound()
               if (sse.conv) remember(sse.conv, req.sig)
               const msg = sse.calls
                 ? { role: "assistant", content: sse.text || null, tool_calls: sse.calls }
@@ -1042,37 +1152,14 @@ export async function ChatglmAuthPlugin({ client }) {
             const out = new ReadableStream({
               async start(ctrl) {
                 sse.onChunk = (chunk) => ctrl.enqueue(enc.encode("data: " + JSON.stringify(chunk) + "\n\n"))
-                const dec = new TextDecoder()
-                const reader = res.body.getReader()
-                let buf = ""
-                const finish = () => {
-                  if (sse.conv) remember(sse.conv, req.sig)
-                  if (!sse.finished) sse.end()
-                  // 标准 OpenAI 流式 usage 尾块(choices 空)
-                  ctrl.enqueue(enc.encode("data: " + JSON.stringify({ id: sse.id, object: "chat.completion.chunk", created: Math.floor(Date.now() / 1000), model: sse.model, choices: [], usage: usageEstimate() }) + "\n\n"))
-                  ctrl.enqueue(enc.encode("data: [DONE]\n\n"))
-                  ctrl.close()
-                }
-                try {
-                  while (true) {
-                    const { value, done } = await reader.read()
-                    if (done) break
-                    buf += dec.decode(value, { stream: true })
-                    let i
-                    while ((i = buf.indexOf("\n")) >= 0) {
-                      const line = buf.slice(0, i).replace(/\r$/, "")
-                      buf = buf.slice(i + 1)
-                      if (line.startsWith("data:")) {
-                        try { sse.feed(JSON.parse(line.slice(5).trim())) } catch {}
-                      }
-                    }
-                    if (sse.finished) { reader.cancel().catch(() => {}); break }
-                  }
-                  finish()
-                } catch (e) {
-                  log(`stream failed: ${e?.message ?? e}`)
-                  try { finish() } catch {}
-                }
+                await pump(first)
+                if (stalledRound()) await retryRound()
+                if (sse.conv) remember(sse.conv, req.sig)
+                if (!sse.finished) sse.end()
+                // 标准 OpenAI 流式 usage 尾块(choices 空)
+                ctrl.enqueue(enc.encode("data: " + JSON.stringify({ id: sse.id, object: "chat.completion.chunk", created: Math.floor(Date.now() / 1000), model: sse.model, choices: [], usage: usageEstimate() }) + "\n\n"))
+                ctrl.enqueue(enc.encode("data: [DONE]\n\n"))
+                ctrl.close()
               },
             })
             return new Response(out, { status: 200, headers: keepHeaders })
@@ -1088,7 +1175,7 @@ export async function ChatglmAuthPlugin({ client }) {
         const c = credsOf(auth)
         if (!c) return provider.models
         const was = Object.values(provider.models)[0] || {}
-        const limit = was.limit || { context: 200000, output: 32000 }
+        const limit = was.limit || LIMIT
         try {
           const ms = await listModels(c)
           if (!ms.length) return provider.models
@@ -1135,5 +1222,6 @@ export const _internal = {
   luhnStamp, md5hex, uuid32, signedHeaders, credsOf, parseCookies, translateRequest,
   ChatglmSSE, textOf, remember, convs, findBrowser, jwtIsGuest, browserFlow,
   normalizeTools, parseToolCalls, sliceJsonObject, looseJson, jsonClosed, renderTurn, estimateTokens,
+  looksStalled, repairJson, TOOL_NUDGE, TOOL_NUDGE_BROKEN,
   HOST, SIGN_SALT, ASSISTANT_ID, VARIANTS,
 }
