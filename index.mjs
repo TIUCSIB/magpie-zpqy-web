@@ -439,30 +439,15 @@ function estimateTokens(s) {
   return cjk + Math.ceil(other / 4)
 }
 
-// 会话映射: 清言 conv id → { sig: 已发出的「我方回合」指纹, ctxKey: 上下文指纹, busy: 在途 }。
-// sessions: 客户端会话键(账号+会话头) → 清言 conv id, 作为复用的主隔离依据。
-// 上下文由清言服务端保存; 并发/跨会话/上下文变化一律不复用(见 translateRequest)。
+// 会话映射: conv id → 已发出的「我方回合」指纹(见 translateRequest)。上下文由清言服务端保存。
 const convs = new Map()
-const sessions = new Map()
 const CONV_MAX = 48
 
-function remember(conv, sig, meta = {}) {
+function remember(conv, sig) {
   if (!conv || !Array.isArray(sig)) return
-  const prev = convs.get(conv) || {}
   convs.delete(conv) // 重新插入, 保持 LRU 顺序
-  convs.set(conv, { sig, ctxKey: meta.ctxKey ?? prev.ctxKey, acct: meta.acct ?? prev.acct, busy: !!meta.busy })
-  if (meta.sessionKey) sessions.set(meta.sessionKey, conv)
-  while (convs.size > CONV_MAX) {
-    const [old] = convs.entries().next().value
-    convs.delete(old)
-    for (const [k, v] of sessions) if (v === old) sessions.delete(k)
-  }
-}
-
-// 并发守卫: 同一清言会话在途时, 第二个请求禁止复用(避免交叉写入服务端上下文)
-function setBusy(conv, on) {
-  const rec = convs.get(conv)
-  if (rec) rec.busy = !!on
+  convs.set(conv, sig)
+  while (convs.size > CONV_MAX) convs.delete(convs.keys().next().value)
 }
 
 // ---- 工具调用 -----------------------------------------------------------------------
@@ -482,7 +467,6 @@ const TOOL_PROTOCOL = (tools) => `# 工具调用协议(必须严格遵守)
 - 按工具的描述选工具: 本地文件、shell 命令一律用对应的本地工具, 描述带「网页/浏览/打开链接」的工具不要拿来执行命令或读文件。
 - 上一个调用报错后绝不允许原样重发: 先说清错在哪, 换参数或换工具再试。
 - 调用 JSON 只出现在正式回复里 —— 思考/草稿里写的调用不会被执行, 不要把真正的调用写进思考。
-- arguments 的键名逐字符照抄参数 schema(该下划线就下划线, 不要自创 camelCase 简写); required 字段一个不能少、不能留空。
 
 ## 可用工具
 ${tools.map((t) => `### ${t.function.name}\n${t.function.description || "(无描述)"}\n参数 schema: ${JSON.stringify(t.function.parameters)}`).join("\n\n")}
@@ -527,12 +511,6 @@ const TOOL_NUDGE_BROKEN = `# 注意
 请重新完整输出一次: 所有参数值都在同一行内, 代码里的换行写成 \\n(反斜杠 + n), 不要用真实换行。
 格式: {"tool_calls":[{"name":"工具名","arguments":{...}}]}`
 
-// 缺必填参数/键名不对时的续写轮: 点名 required 与键名纪律
-const TOOL_NUDGE_ARGS = `# 注意
-你上一条回复里的工具调用缺少必填参数, 或键名和参数 schema 对不上(比如该写 file_path 却写成 filePath)。
-请重新完整输出: arguments 的键名逐字符照抄各工具的参数 schema(该下划线就下划线), required 字段一个不能少、不能留空。
-格式: {"tool_calls":[{"name":"工具名","arguments":{...全部必填参数...}}]}`
-
 // 工具定义归一到 OpenAI 形状(顺带吃下 Anthropic 风格的 {name, input_schema})
 function normalizeTools(tools) {
   return (Array.isArray(tools) ? tools : [])
@@ -553,9 +531,9 @@ function normalizeTools(tools) {
 
 // 从 key 处往前找 {, 再向后配平括号, 抠出一个完整 JSON 对象(字符串里的括号不算)
 // key 可能带引号也可能是裸键(模型写 JS 对象字面量的情况)
-function sliceJsonObject(str, key, from = 0) {
-  let at = str.indexOf(`"${key}"`, from)
-  if (at < 0) at = str.indexOf(key, from)
+function sliceJsonObject(str, key) {
+  let at = str.indexOf(`"${key}"`)
+  if (at < 0) at = str.indexOf(key)
   if (at < 0) return null
   let start = at
   while (start > 0 && str[start] !== "{") start--
@@ -637,18 +615,12 @@ function toToolCall(c, i = 0) {
   const fn = c?.function || c || {}
   const name = fn.name || fn.tool_name || c?.tool_name || ""
   if (typeof name !== "string" || !name) return null
-  let args = fn.arguments ?? fn.parameters ?? fn.args ?? c?.arguments ?? c?.parameters
-  if (typeof args === "string") {
-    const parsed = looseJson(args)
-    if (parsed === null) return null // 参数不是合法 JSON: 不静默变成空对象
-    args = parsed
-  }
-  if (args == null) args = {}
-  if (typeof args !== "object" || Array.isArray(args)) return null // 参数必须是 JSON 对象
+  let args = fn.arguments ?? fn.parameters ?? fn.args ?? c?.arguments ?? c?.parameters ?? {}
+  if (typeof args === "string") args = looseJson(args) ?? {} // 字符串里还包着一层就再解一层
   return {
     id: typeof c?.id === "string" && c.id ? c.id : `call_${uuid32().slice(0, 10)}_${callSeq++}_${i}`,
     type: "function",
-    function: { name, arguments: JSON.stringify(args) },
+    function: { name, arguments: JSON.stringify(args ?? {}) },
   }
 }
 
@@ -669,55 +641,8 @@ function parseToolTag(inner) {
   return toToolCall({ name, arguments: args })
 }
 
-// 参数按声明 schema 对齐与校验: 键名归一(filePath→file_path)、类型检查、required 齐全。
-// 返回 null 表示该调用不合法 —— 不得交给客户端(缺参数不应被静默补成 {})。
-function alignCallArgs(call, tools) {
-  const def = tools.find((t) => t.function.name === call.function.name)
-  if (!def) return null // 只允许本轮声明过的工具
-  const params = def.function.parameters || {}
-  const props = params.properties || {}
-  const norm = (k) => String(k).replace(/[_\s-]/g, "").toLowerCase()
-  const byNorm = new Map(Object.keys(props).map((p) => [norm(p), p]))
-  let args
-  try { args = JSON.parse(call.function.arguments || "{}") } catch { return null }
-  if (!args || typeof args !== "object" || Array.isArray(args)) return null
-  for (const k of Object.keys(args)) {
-    const declared = byNorm.get(norm(k))
-    if (declared && declared !== k) { args[declared] = args[k]; delete args[k] }
-  }
-  for (const [k, v] of Object.entries(args)) {
-    const p = props[k]
-    if (p && !schemaTypeOk(p.type, v)) return null
-  }
-  const required = Array.isArray(params.required) ? params.required : []
-  for (const r of required) {
-    if (args[r] == null || args[r] === "") return null
-    if (props[r] && !schemaTypeOk(props[r].type, args[r])) return null
-  }
-  call.function.arguments = JSON.stringify(args)
-  return call
-}
-
-// 轻量 JSON Schema 类型检查(只覆盖常见 type; 未知类型一律放行, 不阻断)
-function schemaTypeOk(type, v) {
-  if (type == null) return true
-  if (Array.isArray(type)) return type.some((t) => schemaTypeOk(t, v))
-  switch (type) {
-    case "string": return typeof v === "string"
-    case "number": return typeof v === "number" && Number.isFinite(v)
-    case "integer": return Number.isInteger(v)
-    case "boolean": return typeof v === "boolean"
-    case "array": return Array.isArray(v)
-    case "object": return !!v && typeof v === "object" && !Array.isArray(v)
-    case "null": return v === null
-    default: return true
-  }
-}
-
-// 从模型输出里抠出工具调用 → { calls, text, invalid, complete }(text = 剥掉调用后的正文)
-// 调用方传入 tools 时做严格校验: 未知工具 / 非法参数 / 缺 required 的调用会被丢弃(计入 invalid),
-// 正文、调用、解析失败三者互不污染。invalid>0 时驱动层用 TOOL_NUDGE_ARGS 走续写轮补齐。
-function parseToolCalls(raw, tools) {
+// 从模型输出里抠出工具调用 → { calls, text }(text = 剥掉调用后的正文); 没有则 null
+function parseToolCalls(raw) {
   const s = String(raw || "")
   if (!s.trim()) return null
   const groups = [] // { at, len, calls }
@@ -729,25 +654,17 @@ function parseToolCalls(raw, tools) {
   const fence = s.match(/```[a-zA-Z]*\s*([\s\S]*?)\s*```/)
   if (!groups.length) {
     // 提示词协议要求的 {"tool_calls":[...]}(裸 JSON / 代码围栏 / 单数 tool_call 都认)
-    // 从左到右把每一段都收进来: 模型常连发多段(一段更新任务清单、一段干正事),
-    // 只取第一段的话, 后面的整段漏成正文
-    for (const key of ["tool_calls", "tool_call"]) {
-      let from = 0
-      while (true) {
-        const frag = sliceJsonObject(s, key, from)
-        if (!frag) break
-        const at = Math.max(from, s.indexOf(frag, from))
-        const parsed = looseJson(frag)
-        const list = parsed?.[key]
-        const calls = (Array.isArray(list) ? list : list ? [list] : []).map((c) => toToolCall(c)).filter(Boolean)
-        if (calls.length) {
-          groups.push({ at, len: frag.length, calls })
-          from = at + frag.length
-        } else {
-          from = at + 1 // 这段不是合法调用(多半是正文举例), 接着往后扫
-        }
-      }
-      if (groups.length) break
+    for (const body of [fence && fence[1], s]) {
+      if (!body) continue
+      const frag = sliceJsonObject(body, "tool_calls") || sliceJsonObject(body, "tool_call")
+      if (!frag) continue
+      const parsed = looseJson(frag)
+      const list = parsed?.tool_calls ?? parsed?.tool_call
+      const calls = (Array.isArray(list) ? list : list ? [list] : []).map((c) => toToolCall(c)).filter(Boolean)
+      if (!calls.length) continue
+      const at = s.indexOf(frag)
+      groups.push({ at: at < 0 ? 0 : at, len: at < 0 ? 0 : frag.length, calls })
+      break
     }
   }
   if (!groups.length) {
@@ -767,16 +684,7 @@ function parseToolCalls(raw, tools) {
   let text = s
   for (const g of [...groups].sort((a, b) => b.at - a.at)) text = text.slice(0, g.at) + text.slice(g.at + g.len)
   text = text.replace(/```[a-zA-Z]*\s*```/g, "").trim() // 顺手清掉被掏空的围栏
-  text = text.replace(/<invoke_app>[^<]*<\/invoke_app>/g, "").trim() // 臆造的包装标签
-  const calls = []
-  let invalid = 0
-  for (const c of groups.flatMap((g) => g.calls)) {
-    if (!tools?.length) { calls.push(c); continue } // 无声明可校验(单测/兼容路径)
-    const ok = alignCallArgs(c, tools)
-    if (ok) calls.push(ok)
-    else invalid++ // 未知工具/非法参数/缺 required: 丢弃, 不交给客户端
-  }
-  return { calls, text, invalid, complete: invalid === 0 }
+  return { calls: groups.flatMap((g) => g.calls), text }
 }
 
 // 模型正文是不是「可能开始写工具调用」(决定要不要先缓冲不往外发)
@@ -823,7 +731,7 @@ function renderTurn(m) {
 // 复用: 已发出的「我方回合」(user + 工具结果) 是本次的前缀 → 只补发新增的那些;
 //       中间的 assistant 回合不算 —— 那是清言服务端自己生成的。
 // 兜底: 对不上(新会话 / agent 换了上下文 / 历史被压缩)→ 新会话, system+工具协议+历史 内联合并。
-function translateRequest(openai, tools, ctx = {}) {
+function translateRequest(openai, tools) {
   const msgs = Array.isArray(openai.messages) ? openai.messages : []
   const sys = msgs.filter((m) => m.role === "system" || m.role === "developer").map((m) => textOf(m.content)).filter(Boolean).join("\n\n")
   const turns = msgs.filter((m) => m.role !== "system" && m.role !== "developer").map(renderTurn)
@@ -833,38 +741,17 @@ function translateRequest(openai, tools, ctx = {}) {
   // 发的是增量还是全量只是传输方式, 客户端的上下文总量是一样的。
   const fullText = [sys && `# 系统指令(必须遵循)\n${sys}`, tools.length && TOOL_PROTOCOL(tools), ...turns.map((t) => t.text)].filter(Boolean).join("\n\n")
 
-  // 上下文指纹: 系统提示 / 工具定义 / 模型 / 档位任一变化都不复用旧会话(服务端上下文已不兼容)。
-  // 调用方没给 ctx(单测/兼容) 时 ctxKey 为 undefined, 行为与旧版一致(不校验)。
-  const hasCtx = !!(ctx && (ctx.model !== undefined || ctx.effort !== undefined || ctx.sessionKey || ctx.acct))
-  const ctxKey = hasCtx ? md5hex([sys, JSON.stringify(tools), ctx.model || "", ctx.effort || ""].join("\u0000")) : undefined
-  const skey = hasCtx && ctx.sessionKey ? `${ctx.acct || "acct"}\u0000${ctx.sessionKey}` : ""
-  const usable = (sent) =>
-    Array.isArray(sent) && sent.length > 0 && sent.length <= sig.length &&
-    sig.length - sent.length <= 8 &&
-    sent.every((h, i) => h === sig[i])
-
   let best = null
-  if (skey) {
-    // 主路径: 客户端会话头 + 账号 → 唯一 conv(上下文一致且不在途才复用)
-    const conv = sessions.get(skey)
-    const rec = conv && convs.get(conv)
-    if (rec && !rec.busy && rec.ctxKey === ctxKey && rec.acct === ctx.acct && usable(rec.sig)) best = { conv, sent: rec.sig }
-  }
-  // 降级: 拿不到会话头/主路径未命中时, 按「内容前缀 + 上下文/账号指纹 + 不在途」匹配。
-  // 这是无稳定会话 ID 环境的兼容方案 —— 0.3.0 曾把降级错禁成 !hasCtx 才生效, 而调用方
-  // 总是带 ctx, 导致每轮全量内联、几乎不可用。现在不再仅凭前缀: 指纹/账号/在途缺一不复用。
-  if (!best) {
-    for (const [conv, rec] of convs) {
-      if (!rec || rec.busy || rec.ctxKey !== ctxKey || rec.acct !== ctx.acct) continue
-      if (!usable(rec.sig)) continue
-      if (!best || rec.sig.length > best.sent.length) best = { conv, sent: rec.sig }
-    }
+  for (const [conv, sent] of convs) {
+    if (!sent.length || sent.length > sig.length) continue
+    if (sig.length - sent.length > 8) continue // 一次补太多说明历史对不上, 不如重开
+    if (!sent.every((h, i) => h === sig[i])) continue
+    if (!best || sent.length > best.sent.length) best = { conv, sent }
   }
   if (best && sig.length > best.sent.length) {
     const fresh = mine.slice(best.sent.length)
     let text = fresh.map((t, i) => (t.role === "tool" && i === fresh.length - 1 ? `${t.text}\n\n${TOOL_REMINDER}` : t.text)).join("\n\n")
-    setBusy(best.conv, true) // 在途标记: 并发请求不得复用同一会话
-    return { conv: best.conv, text, sig, fullText, ctxKey, sessionKey: skey, acct: ctx.acct }
+    return { conv: best.conv, text, sig, fullText }
   }
 
   const hist = turns
@@ -877,7 +764,7 @@ function translateRequest(openai, tools, ctx = {}) {
   if (tools.length) parts.push(TOOL_PROTOCOL(tools))
   if (hist) parts.push(`# 对话历史(接续)\n${hist}`)
   parts.push(`# 本轮用户消息\n${last || "(空)"}`)
-  return { conv: "", text: parts.join("\n\n"), sig, fullText, ctxKey, sessionKey: skey, acct: ctx.acct }
+  return { conv: "", text: parts.join("\n\n"), sig, fullText }
 }
 
 // 清言 SSE 事件 → OpenAI chat.completion.chunk。
@@ -897,8 +784,6 @@ class ChatglmSSE {
     this.mode = this.tools.length ? "probe" : "text" // probe: 先缓冲, 看是不是工具调用
     this.buf = ""
     this.finished = false
-    this.failed = false // 上游 status=error / 读流异常: 终止但不得报正常 finish
-    this.termination = null // stop | tool_calls | length | content_filter
     this.roundDone = false
     this.holdEnd = false // 为 true 时 finish 帧只标记本回合结束, 不终结整条流(空转要续写一轮)
     this.error = null
@@ -934,7 +819,7 @@ class ChatglmSSE {
     if (le && (le.message || le.code)) this.error = String(le.message || le.code)
     // 上游偶尔用 status=error 收尾(实测: 模型退化时狂吐 50 万字后报错), 必须当终止信号,
     // 否则 holdEnd 下等不到 finish 帧, 空了会一直挂到连接关闭, 甚至被误判成空转再补一轮。
-    if (evt.status === "error") { this.failed = true; if (!this.error) this.error = le?.intervene_text || "上游返回 error" }
+    if (evt.status === "error" && !this.error) this.error = le?.intervene_text || "上游返回 error"
     if (evt.status === "intervene") this.intervene = le?.intervene_text || this.error || "内容因合规限制被拦截"
     for (const p of evt.parts || []) this.feedPart(p)
     if (evt.status === "finish" || evt.status === "intervene" || evt.status === "error") {
@@ -994,21 +879,17 @@ class ChatglmSSE {
     if (this.finished) return
     this.finished = true
     if (this.buf) { const b = this.buf; this.buf = ""; this.emitContent(b) }
-    // 上游明确报错/读流异常: 不发正常 finish —— 错误对象由驱动层按 OpenAI 流内错误补发
-    if (this.failed) return
-    const parsed = this.tools.length ? parseToolCalls(this.raw, this.tools) : null
+    const parsed = this.tools.length ? parseToolCalls(this.raw) : null
     if (parsed?.calls.length) {
       // 整个 tool_calls 一次性给出(与 HelloGML 同策略: 解析要等正文收完才准)
       parsed.calls.forEach((c, i) => this.emit({ tool_calls: [{ index: i, id: c.id, type: "function", function: { name: c.function.name, arguments: c.function.arguments } }] }))
       this.calls = parsed.calls
-      this.termination = "tool_calls"
       return this.emit({}, "tool_calls")
     }
     const note = this.intervene || this.error
     if (note && !this.text) this.emitContent(`[chatglm] ${note}`)
-    // OpenAI 语义: 合规拦截→content_filter, 被掐断→length, 正常收尾→stop
-    this.termination = this.intervene ? "content_filter" : this.truncated ? "length" : "stop"
-    this.emit({}, this.termination)
+    // OpenAI 语义: 被掐断的输出报 length, 正常收尾才是 stop
+    this.emit({}, this.truncated ? "length" : "stop")
   }
 }
 
@@ -1138,31 +1019,18 @@ export async function ChatglmAuthPlugin({ client }) {
             let tools = tc === "none" ? [] : normalizeTools(openai.tools)
             // OpenAI 兼容: 指定函数时只把那个函数放进协议, required 时强制本轮必须出调用
             if (tc && typeof tc === "object" && tc.function?.name) tools = tools.filter((t) => t.function.name === tc.function.name)
+            const req = translateRequest(openai, tools)
+            if ((tc === "required" || (tc && typeof tc === "object")) && tools.length) {
+              req.text += `\n\n# 强制\n本轮必须输出 {"tool_calls":[...]} 开始执行, 禁止纯文本回答。${tc?.function?.name ? `使用工具 ${tc.function.name}。` : ""}`
+            }
             // 档位来源: magpie variants 走 reasoning_effort 字段; 也认模型 id 后缀(:high/:max)
             let model = openai.model || "glm-5.3-flash"
             let effort = ""
             const suffix = model.match(/:(low|high|max)$/i)
             if (suffix) { model = model.slice(0, -suffix[0].length); effort = suffix[1].toLowerCase() }
             effort = String(openai.reasoning_effort || openai.reasoningEffort || openai.effort || effort || "").toLowerCase()
-            if (effort === "minimal") effort = "low" // OpenAI 档位别名 → 清言最近档
-            else if (effort === "medium") effort = "high"
             if (!EFFORTS.includes(effort)) effort = DEFAULT_EFFORT
             const mode = EFFORT_TO_META[effort]
-            // 会话隔离: 客户端会话头作主键, 账号 + 模型/档位参与上下文指纹
-            const hdr = (name) => {
-              const h = input instanceof Request ? input.headers : (init?.headers || {})
-              if (h && typeof h.get === "function") return h.get(name) || ""
-              const k = Object.keys(h || {}).find((x) => x.toLowerCase() === name)
-              return k ? String(h[k]) : ""
-            }
-            let authInfo = null
-            try { authInfo = await getAuth() } catch {}
-            const sessionKey = hdr("x-session-id") || hdr("x-conversation-id") || hdr("x-thread-id")
-            const acct = authInfo?.accountId || `tok:${md5hex(c.token).slice(0, 12)}`
-            const req = translateRequest(openai, tools, { sessionKey, acct, model, effort })
-            if ((tc === "required" || (tc && typeof tc === "object")) && tools.length) {
-              req.text += `\n\n# 强制\n本轮必须输出 {"tool_calls":[...]} 开始执行, 禁止纯文本回答。${tc?.function?.name ? `使用工具 ${tc.function.name}。` : ""}`
-            }
             const glmBody = (text, convId) => JSON.stringify({
               assistant_id: ASSISTANT_ID,
               conversation_id: convId,
@@ -1182,7 +1050,6 @@ export async function ChatglmAuthPlugin({ client }) {
               let res = null
               let err = null
               for (let attempt = 0; attempt < 2; attempt++) {
-                if (opts.signal?.aborted) { err = opts.signal.reason || new Error("aborted"); err.name = "AbortError"; break }
                 try {
                   res = await fetch(`${HOST}/chatglm/backend-api/assistant/stream`, {
                     method: "POST",
@@ -1193,7 +1060,6 @@ export async function ChatglmAuthPlugin({ client }) {
                 } catch (e) {
                   err = e
                   res = null
-                  if (opts.signal?.aborted || e?.name === "AbortError") break // 客户端取消不重试
                 }
                 // 只重试「没建起来」的请求: 流已经开始就不能重来(会双份输出)
                 if (res?.ok) break
@@ -1217,7 +1083,6 @@ export async function ChatglmAuthPlugin({ client }) {
               JSON.stringify({ error: { message: String(e?.message ?? e), type: "server_error", param: null, code: e?.status ? String(e.status) : "upstream_error" } }),
               { status: e?.status ?? 502, headers: { "content-type": "application/json", "x-magpie-sign-in": e?.signIn || "kept" } },
             )
-            const errPayload = (message, type = "server_error", code = null) => ({ error: { message: String(message), type, param: null, code } })
 
             let first = null
             try {
@@ -1228,11 +1093,6 @@ export async function ChatglmAuthPlugin({ client }) {
             }
 
             const keepHeaders = { "content-type": "text/event-stream; charset=utf-8", "cache-control": "no-cache", "x-magpie-sign-in": "kept" }
-            // 取消传播: 客户端断开(信号或流取消)时, 同步取消上游读取, 不再发起续写
-            let aborted = false
-            let curReader = null
-            const onAbort = () => { aborted = true; try { curReader?.cancel() } catch {} }
-            if (opts.signal) opts.signal.addEventListener("abort", onAbort, { once: true })
             const sse = new ChatglmSSE(model, { tools })
             sse.holdEnd = true // finish 帧只标记回合结束; 空转时还要补一轮
 
@@ -1248,17 +1108,15 @@ export async function ChatglmAuthPlugin({ client }) {
               completion_tokens_details: { reasoning_tokens: estimateTokens(sse.think) },
             })
 
-            // 一轮的 SSE 流进 sse; 返回终止原因: done | round-done | truncated | aborted | read-error
+            // 一轮的 SSE 流进 sse; 回合结束(roundDone)就停, 不等连接关闭
             const pump = async (res) => {
               const reader = res.body.getReader()
-              curReader = reader
               const dec = new TextDecoder()
               let buf = ""
               try {
                 while (true) {
-                  if (opts.signal?.aborted) { reader.cancel().catch(() => {}); return "aborted" }
                   const { value, done } = await reader.read()
-                  if (done) return "done"
+                  if (done) break
                   buf += dec.decode(value, { stream: true })
                   let i
                   while ((i = buf.indexOf("\n")) >= 0) {
@@ -1274,37 +1132,29 @@ export async function ChatglmAuthPlugin({ client }) {
                     sse.truncated = true
                     reader.cancel().catch(() => {})
                     sse.end()
-                    return "truncated"
+                    return
                   }
-                  if (sse.roundDone || sse.finished) { reader.cancel().catch(() => {}); return "round-done" }
+                  if (sse.roundDone || sse.finished) { reader.cancel().catch(() => {}); return }
                 }
               } catch (e) {
-                if (aborted || opts.signal?.aborted || e?.name === "AbortError") return "aborted"
-                log(`stream read failed: ${e?.message ?? e}`)
-                sse.failed = true // 读流中断: 不得伪装成正常完成
-                return "read-error"
-              } finally {
-                curReader = null
+                log(`stream failed: ${e?.message ?? e}`)
               }
             }
 
             // 这一轮没给出工具调用、正文也只是半句引导语 → 补一轮(只补一次)
             // 注意: 不能用 sse.calls —— 它在 end() 里才赋值, 而 holdEnd 下 end() 还没跑
             let retried = false
-            let nudgeKind = "stall"
             const stalledRound = () => {
-              if (retried || aborted || sse.failed || (sse.error && !sse.roundDone)) return false // 取消/上游报错: 续写只会再撞一次
-              const pr = parseToolCalls(sse.raw, sse.tools)
-              if (pr?.calls?.length) return false // 这一轮已经拿到可执行调用(不合法的已在解析层丢弃)
+              if (retried) return false
+              if (sse.error && !sse.roundDone) return false // 上游报错/断了: 续写只会再撞一次
+              if (parseToolCalls(sse.raw)?.calls?.length) return false // 这一轮已经拿到调用, 不算空转
               if ((sse.text || "").trim().length > STALL_MAX_LEN) return false
-              // 有调用但参数不合法/缺 required → 按 schema 重写; 只写到一半 → 重写整段
-              nudgeKind = pr?.invalid ? "args" : TOOL_MARK.test(sse.raw) ? "broken" : "stall"
-              return nudgeKind === "stall" ? looksStalled(sse.text) : true
+              // 工具 JSON 写到一半: 原文里已经有调用痕迹, 解析却没成 → 让它重写一遍
+              return TOOL_MARK.test(sse.raw) ? true : looksStalled(sse.text)
             }
             const retryRound = async () => {
               retried = true
-              if (aborted || sse.failed || opts.signal?.aborted) return // 取消/上游报错后不再发起生成
-              const nudge = nudgeKind === "args" ? TOOL_NUDGE_ARGS : nudgeKind === "broken" ? TOOL_NUDGE_BROKEN : TOOL_NUDGE
+              const nudge = TOOL_MARK.test(sse.raw) ? TOOL_NUDGE_BROKEN : TOOL_NUDGE
               let res = null
               try {
                 res = await startRound(nudge, sse.conv || req.conv)
@@ -1316,53 +1166,35 @@ export async function ChatglmAuthPlugin({ client }) {
               await pump(res)
             }
 
-            if (openai.stream !== true) {
-              // 非流式(缺省与 stream=false 均走这里): 聚合后回一个 chat.completion
+            if (openai.stream === false) {
+              // 非流式: 聚合后回一个 chat.completion
               await pump(first)
               if (stalledRound()) await retryRound()
-              if (sse.conv) remember(sse.conv, req.sig, { ctxKey: req.ctxKey, sessionKey: req.sessionKey, acct: req.acct })
-              setBusy(req.conv, false)
-              if (!sse.finished) sse.end() // holdEnd 推迟了 end, 这里必须补: 否则 sse.calls 恒为空
-              // 尚未向客户端输出任何内容 → 可用 HTTP 错误表达失败(OpenAI 错误体)
-              if (sse.failed) return new Response(JSON.stringify(errPayload(sse.error || "上游返回错误", "upstream_error", "upstream_error")), { status: 502, headers: { "content-type": "application/json", "x-magpie-sign-in": "kept" } })
+              if (sse.conv) remember(sse.conv, req.sig)
               const msg = sse.calls
                 ? { role: "assistant", content: sse.text || null, tool_calls: sse.calls }
                 : { role: "assistant", content: sse.text || `[chatglm] 空回复${sse.error ? `: ${sse.error}` : ""}` }
               return new Response(JSON.stringify({
                 id: sse.id, object: "chat.completion", created: Math.floor(Date.now() / 1000), model,
-                choices: [{ index: 0, message: msg, finish_reason: sse.termination || (sse.calls ? "tool_calls" : "stop") }],
+                choices: [{ index: 0, message: msg, finish_reason: sse.calls ? "tool_calls" : sse.truncated ? "length" : "stop" }],
                 usage: usageEstimate(),
               }), { status: 200, headers: { "content-type": "application/json", "x-magpie-sign-in": "kept" } })
             }
 
-            // 流式: 清言 SSE → OpenAI chunk(仅 openai.stream === true)
+            // 流式: 清言 SSE → OpenAI chunk
             const enc = new TextEncoder()
-            const wantUsage = openai.stream_options?.include_usage === true
             const out = new ReadableStream({
               async start(ctrl) {
-                const emitLine = (obj) => ctrl.enqueue(enc.encode("data: " + JSON.stringify(obj) + "\n\n"))
-                sse.onChunk = (chunk) => emitLine(chunk)
+                sse.onChunk = (chunk) => ctrl.enqueue(enc.encode("data: " + JSON.stringify(chunk) + "\n\n"))
                 await pump(first)
-                if (!aborted && !sse.failed && stalledRound()) await retryRound()
-                if (sse.conv) remember(sse.conv, req.sig, { ctxKey: req.ctxKey, sessionKey: req.sessionKey, acct: req.acct })
-                setBusy(req.conv, false) // 清理在途标记(复用分支在 translateRequest 里置位)
-                if (aborted) { try { ctrl.close() } catch {} return } // 客户端已断开: 静默收尾, 不发错误也不发 finish
+                if (stalledRound()) await retryRound()
+                if (sse.conv) remember(sse.conv, req.sig)
                 if (!sse.finished) sse.end()
-                if (sse.failed) {
-                  // 上游明确报错/读取中断: OpenAI 流内错误对象, 不伪装成正常完成
-                  emitLine(errPayload(sse.error || "上游流中断", "upstream_error", "upstream_error"))
-                  ctrl.enqueue(enc.encode("data: [DONE]\n\n"))
-                  ctrl.close()
-                  return
-                }
-                if (wantUsage) {
-                  // 仅 include_usage 时输出 usage 尾块(choices 空), 与官方语义一致
-                  emitLine({ id: sse.id, object: "chat.completion.chunk", created: Math.floor(Date.now() / 1000), model: sse.model, choices: [], usage: usageEstimate() })
-                }
+                // 标准 OpenAI 流式 usage 尾块(choices 空)
+                ctrl.enqueue(enc.encode("data: " + JSON.stringify({ id: sse.id, object: "chat.completion.chunk", created: Math.floor(Date.now() / 1000), model: sse.model, choices: [], usage: usageEstimate() }) + "\n\n"))
                 ctrl.enqueue(enc.encode("data: [DONE]\n\n"))
                 ctrl.close()
               },
-              cancel() { onAbort() }, // 客户端取消 SSE 消费: 停止读上游并清理
             })
             return new Response(out, { status: 200, headers: keepHeaders })
           },
@@ -1424,7 +1256,6 @@ export const _internal = {
   luhnStamp, md5hex, uuid32, signedHeaders, credsOf, parseCookies, translateRequest,
   ChatglmSSE, textOf, remember, convs, findBrowser, jwtIsGuest, browserFlow,
   normalizeTools, parseToolCalls, sliceJsonObject, looseJson, jsonClosed, renderTurn, estimateTokens,
-  looksStalled, repairJson, TOOL_NUDGE, TOOL_NUDGE_BROKEN, TOOL_NUDGE_ARGS, MAX_OUTPUT_CHARS,
-  alignCallArgs, schemaTypeOk, sessions, setBusy,
+  looksStalled, repairJson, TOOL_NUDGE, TOOL_NUDGE_BROKEN, MAX_OUTPUT_CHARS,
   HOST, SIGN_SALT, ASSISTANT_ID, VARIANTS,
 }

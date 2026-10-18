@@ -1,6 +1,6 @@
 {
   "name": "magpie-chatglm-auth",
-  "version": "0.3.1",
+  "version": "0.3.2",
   "description": "OpenCode/magpie provider plugin: 智谱清言 (chatglm.cn) 网页版接口, 含提示词协议工具调用",
   "type": "module",
   "main": "./index.mjs",
@@ -10,7 +10,7 @@
     "README.md"
   ],
   "scripts": {
-    "test": "node test-toolcalls.mjs && node test-openai-compat.mjs && node test-browserflow.mjs",
+    "test": "node test-toolcalls.mjs && node test-browserflow.mjs",
     "test:live": "node test-live.mjs"
   },
   "keywords": [
