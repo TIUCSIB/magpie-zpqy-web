@@ -786,10 +786,10 @@ class ChatglmSSE {
 
   // 同一会话内再发一轮前调用: 解析只看这一轮的输出, 已发出的正文不回滚
   beginRound() {
+    if (this.buf) { const b = this.buf; this.buf = ""; this.emitContent(b) } // 上一轮末尾还押着的正文先放出去
     this.roundDone = false
     this.raw = ""
     this.mode = this.tools.length ? "probe" : "text"
-    this.buf = ""
   }
 
   emit(delta, finish) {
@@ -1111,9 +1111,11 @@ export async function ChatglmAuthPlugin({ client }) {
             }
 
             // 这一轮没给出工具调用、正文也只是半句引导语 → 补一轮(只补一次)
+            // 注意: 不能用 sse.calls —— 它在 end() 里才赋值, 而 holdEnd 下 end() 还没跑
             let retried = false
             const stalledRound = () => {
-              if (retried || sse.calls?.length) return false
+              if (retried) return false
+              if (parseToolCalls(sse.raw)?.calls?.length) return false // 这一轮已经拿到调用, 不算空转
               if ((sse.text || "").trim().length > STALL_MAX_LEN) return false
               // 工具 JSON 写到一半: 原文里已经有调用痕迹, 解析却没成 → 让它重写一遍
               return TOOL_MARK.test(sse.raw) ? true : looksStalled(sse.text)

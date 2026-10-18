@@ -185,5 +185,17 @@ check('续写轮给出 tool_calls', held.calls?.[0]?.function?.name, 'bash')
 check('两轮正文都保留', held.text, '继续：')
 check('最终 finish_reason=tool_calls', chunks.at(-1).choices[0].finish_reason, 'tool_calls')
 
+console.log('[15] beginRound: 上一轮押在缓冲里的正文不能丢')
+// 末尾以 { 开头时正文还压在 buf 里(probe 态), 直接清空会让这句话凭空消失
+chunks.length = 0
+const carried = new ChatglmSSE('glm-5.3', { tools, onChunk: (c) => chunks.push(c) })
+carried.holdEnd = true
+carried.feed({ status: 'init', parts: [{ logic_id: 'p1', status: 'init', content: [{ type: 'text', text: '我先看看：' }] }] })
+carried.feed({ status: 'init', parts: [{ logic_id: 'p1', status: 'init', content: [{ type: 'text', text: '{' }] }] })
+carried.feed({ status: 'finish', parts: [{ logic_id: 'p1', status: 'finish', content: [{ type: 'text', text: '我先看看：{' }] }] })
+check('收尾前正文还押在 buf 里', carried.text, '我先看看：')
+carried.beginRound()
+check('beginRound 把押着的正文放出去', carried.text, '我先看看：{')
+
 console.log(`\n结果: ${pass} 通过, ${fail} 失败`)
 process.exit(fail ? 1 : 0)
