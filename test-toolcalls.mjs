@@ -146,7 +146,9 @@ check('两个 part 都收全', s.text, '甲乙')
 chunks.length = 0
 s = run([{ status: 'intervene', last_error: { intervene_text: '内容不合规' } }])
 check('intervene 有回话', /内容不合规/.test(s.text), true)
-check('intervene 也是 stop', chunks.at(-1).choices[0].finish_reason, 'stop')
+check('intervene 不当成功完成(无 stop 结束标记)', chunks.every((c) => c.choices[0].finish_reason !== 'stop'), true)
+check('intervene 终态=upstream_error', s.round, 'upstream_error')
+check('intervene 记 outError(由调用方发错误帧)', !!s.outError, true)
 
 console.log('[12] 多行代码参数: 模型不转义换行(JSON 非法)也要能解析')
 // 真实失败形态: oldString/newString 里直接换行, JSON.parse 必挂
@@ -202,7 +204,9 @@ chunks.length = 0
 s = run([{ status: 'error', last_error: { message: '模型服务异常' } }])
 check('error 也收尾', s.finished, true)
 check('error 记到 sse.error', /模型服务异常/.test(s.error || ''), true)
-check('error 时 finish_reason=stop', chunks.at(-1).choices[0].finish_reason, 'stop')
+check('error 不当成功完成(无 stop 结束标记)', chunks.every((c) => c.choices[0].finish_reason !== 'stop'), true)
+check('error 终态=upstream_error', s.round, 'upstream_error')
+check('error 记 outError', !!s.outError, true)
 
 // holdEnd 下 error 必须终结(否则 pump 永远等不到 roundDone, 还会被误判成空转再补一轮)
 chunks.length = 0
@@ -268,13 +272,18 @@ check('TOOL_ERR_RE 识别中文报错', TOOL_ERR_RE.test('命令执行失败, ex
 check('TOOL_ERR_RE 不咬普通输出', TOOL_ERR_RE.test('a.ts b.ts c.ts'), false)
 
 console.log('[21] SSE 出站: 混在新调用里的重发要被丢掉')
+// 这个场景里 open_url 与 bash 都必须是本次声明的工具(终态校验只放行声明内的调用)
+const tools21 = normalizeTools([
+  { type: 'function', function: { name: 'open_url', parameters: { type: 'object', properties: { url: { type: 'string' } } } } },
+  { type: 'function', function: { name: 'bash', parameters: { type: 'object', properties: { command: { type: 'string' } } } } },
+])
 const blockedSet = new Set([callKey('open_url', { url: 'file:///F:/x' })])
 chunks.length = 0
 const both = '{"tool_calls":[{"name":"open_url","arguments":{"url":"file:///F:/x"}},{"name":"bash","arguments":{"command":"ls"}}]}'
 s = run([
   { status: 'init', parts: [{ logic_id: 'p1', status: 'init', content: [{ type: 'text', text: both }] }] },
   { status: 'finish', parts: [{ logic_id: 'p1', status: 'finish', content: [{ type: 'text', text: both }] }] },
-], { tools, blockedCalls: blockedSet })
+], { tools: tools21, blockedCalls: blockedSet })
 check('只发新调用', s.calls.map((c) => c.function.name), ['bash'])
 check('index 重排连续', chunks.filter((c) => c.choices[0].delta.tool_calls)[0].choices[0].delta.tool_calls[0].index, 0)
 check('finish_reason=tool_calls', chunks.at(-1).choices[0].finish_reason, 'tool_calls')
@@ -285,13 +294,51 @@ const repeat = '{"tool_calls":[{"name":"open_url","arguments":{"url":"file:///F:
 s = run([
   { status: 'init', parts: [{ logic_id: 'p1', status: 'init', content: [{ type: 'text', text: repeat }] }] },
   { status: 'finish', parts: [{ logic_id: 'p1', status: 'finish', content: [{ type: 'text', text: repeat }] }] },
-], { tools, blockedCalls: blockedSet })
+], { tools: tools21, blockedCalls: blockedSet })
 check('仍给出调用由客户端兜底', s.calls.map((c) => c.function.name), ['open_url'])
 check('点名续写轮就绪', /原样重发/.test(TOOL_NUDGE_REPEAT) && /换做法/.test(TOOL_NUDGE_REPEAT), true)
 
 console.log('[23] 多围栏: 示例围栏在前, 真调用在正文里')
 check('跳过不含 tool_calls 的围栏', callsOf('示例:\n```json\n{"name":"demo","arguments":{}}\n```\n{"tool_calls":[{"name":"bash","arguments":{"command":"ls"}}]}'), [['bash', '{"command":"ls"}']])
 check('围栏+裸调用并存仍可解析', callsOf('```text\n随便什么\n```\n{"tool_calls":[{"name":"a","arguments":{}}]}'), [['a', '{}']])
+
+console.log('[24] 终态判定: 各路径的 round 与 end 行为')
+const { ROUND, checkToolCall } = _internal
+// 构造一帧「事件级 status + 单个 text part」的清言帧
+const tf = (conv, status, text) => ({
+  ...(conv ? { conversation_id: conv } : {}),
+  status,
+  parts: [{ logic_id: 'p', status, content: [{ type: 'text', text }] }],
+})
+// EOF 没完成帧 → incomplete: 不伪造 finish_reason, 记 outError(EOF 时 pump 会调 end())
+chunks.length = 0
+s = run([tf('cv', 'init', '说了一半')])
+s.end()
+check('没 finish 帧的 end 判 incomplete', s.round, ROUND.INCOMPLETE)
+check('incomplete 不发 finish_reason', chunks.some((c) => c.choices[0].finish_reason), false)
+check('incomplete 记 outError', s.outError?.code, 'stream_incomplete')
+// 半截正文保留原样(不追加错误说明覆盖已有输出)
+check('已有正文不被错误文案顶掉', s.text, '说了一半')
+// pump 先 markRound 再 end 的中断路径
+chunks.length = 0
+const sInt = new ChatglmSSE('glm-5.3', { onChunk: (c) => chunks.push(c) })
+sInt.markRound(ROUND.INTERRUPTED, '读取上游流失败: 连接被重置')
+sInt.end()
+check('interrupted 无 finish_reason', chunks.some((c) => c.choices[0].finish_reason), false)
+check('interrupted 的 outError.code', sInt.outError?.code, 'stream_interrupted')
+check('markRound 先到先得: 已定局不被 EOF 洗白', (() => { sInt.markRound(ROUND.COMPLETED); return sInt.round })(), ROUND.INTERRUPTED)
+// 截断: 报 length 但绝不报 tool_calls/不提交调用
+chunks.length = 0
+const sTr = new ChatglmSSE('glm-5.3', { tools, onChunk: (c) => chunks.push(c) })
+sTr.feed(tf('cv', 'init', '{"tool_calls":[{"name":"bash","arguments":{"command":"ls'))
+sTr.truncated = true
+sTr.markRound(ROUND.TRUNCATED)
+sTr.end()
+check('截断轮不伪装成功工具调用', sTr.calls, null)
+check('截断轮 finish_reason=length', chunks.at(-1).choices[0].finish_reason, 'length')
+// 正常完成轮才有 tool_calls; checkToolCall 把住名字/JSON/schema 三道关
+check('合法调用通过校验', checkToolCall({ function: { name: 'bash', arguments: '{"command":"ls"}' } }, tools), '')
+check('未声明的工具名被拒', /不在本次声明/.test(checkToolCall({ function: { name: 'rm_rf', arguments: '{}' } }, tools)), true)
 
 console.log(`\n结果: ${pass} 通过, ${fail} 失败`)
 process.exit(fail ? 1 : 0)

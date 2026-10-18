@@ -36,8 +36,9 @@ let pass = 0, fail = 0
 const check = (label, cond, extra = '') => { if (cond) { pass++; console.log('  ✓', label) } else { fail++; console.log('  ✗', label, extra) } }
 
 const call = async (body) => {
+  // usage 尾块按 OpenAI 语义需要客户端显式 stream_options.include_usage 才发
   const res = await loader.fetch('https://chatglm.cn/chatglm/backend-api/assistant/stream', {
-    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body),
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ stream_options: { include_usage: true }, ...body }),
   })
   const raw = await res.text()
   if (!res.ok) return { status: res.status, error: raw.slice(0, 300) }
