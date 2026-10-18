@@ -146,7 +146,7 @@ check('两个 part 都收全', s.text, '甲乙')
 chunks.length = 0
 s = run([{ status: 'intervene', last_error: { intervene_text: '内容不合规' } }])
 check('intervene 有回话', /内容不合规/.test(s.text), true)
-check('intervene 也是 stop', chunks.at(-1).choices[0].finish_reason, 'stop')
+check('intervene → content_filter(OpenAI 语义)', chunks.at(-1).choices[0].finish_reason, 'content_filter')
 
 console.log('[12] 多行代码参数: 模型不转义换行(JSON 非法)也要能解析')
 // 真实失败形态: oldString/newString 里直接换行, JSON.parse 必挂
@@ -202,7 +202,7 @@ chunks.length = 0
 s = run([{ status: 'error', last_error: { message: '模型服务异常' } }])
 check('error 也收尾', s.finished, true)
 check('error 记到 sse.error', /模型服务异常/.test(s.error || ''), true)
-check('error 时 finish_reason=stop', chunks.at(-1).choices[0].finish_reason, 'stop')
+check('error 不发正常 finish(错误对象由驱动层补发)', chunks.length, 0)
 
 // holdEnd 下 error 必须终结(否则 pump 永远等不到 roundDone, 还会被误判成空转再补一轮)
 chunks.length = 0
@@ -222,6 +222,13 @@ const tr = new ChatglmSSE('glm-5.3', { onChunk: (c) => chunks.push(c) })
 tr.truncated = true
 tr.end()
 check('截断的输出 finish_reason=length', chunks.at(-1).choices[0].finish_reason, 'length')
+
+console.log('[19] 上游 error 帧: 驱动层发错误对象, 不发正常 finish')
+chunks.length = 0
+s = run([{ status: 'error', last_error: { message: '模型服务异常' } }])
+check('error 也收尾', s.finished, true)
+check('error 记到 sse.error', /模型服务异常/.test(s.error || ''), true)
+check('error 不发正常 finish(错误对象由驱动层补发)', chunks.length, 0)
 
 console.log(`\n结果: ${pass} 通过, ${fail} 失败`)
 process.exit(fail ? 1 : 0)
