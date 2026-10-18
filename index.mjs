@@ -450,7 +450,7 @@ function remember(conv, sig, meta = {}) {
   if (!conv || !Array.isArray(sig)) return
   const prev = convs.get(conv) || {}
   convs.delete(conv) // 重新插入, 保持 LRU 顺序
-  convs.set(conv, { sig, ctxKey: meta.ctxKey ?? prev.ctxKey, busy: !!meta.busy })
+  convs.set(conv, { sig, ctxKey: meta.ctxKey ?? prev.ctxKey, acct: meta.acct ?? prev.acct, busy: !!meta.busy })
   if (meta.sessionKey) sessions.set(meta.sessionKey, conv)
   while (convs.size > CONV_MAX) {
     const [old] = convs.entries().next().value
@@ -848,11 +848,14 @@ function translateRequest(openai, tools, ctx = {}) {
     // 主路径: 客户端会话头 + 账号 → 唯一 conv(上下文一致且不在途才复用)
     const conv = sessions.get(skey)
     const rec = conv && convs.get(conv)
-    if (rec && !rec.busy && rec.ctxKey === ctxKey && usable(rec.sig)) best = { conv, sent: rec.sig }
-  } else if (!hasCtx) {
-    // 降级: 拿不到会话头时按内容指纹匹配(仅上下文一致且不在途的会话语义)
+    if (rec && !rec.busy && rec.ctxKey === ctxKey && rec.acct === ctx.acct && usable(rec.sig)) best = { conv, sent: rec.sig }
+  }
+  // 降级: 拿不到会话头/主路径未命中时, 按「内容前缀 + 上下文/账号指纹 + 不在途」匹配。
+  // 这是无稳定会话 ID 环境的兼容方案 —— 0.3.0 曾把降级错禁成 !hasCtx 才生效, 而调用方
+  // 总是带 ctx, 导致每轮全量内联、几乎不可用。现在不再仅凭前缀: 指纹/账号/在途缺一不复用。
+  if (!best) {
     for (const [conv, rec] of convs) {
-      if (!rec || rec.busy || rec.ctxKey !== ctxKey) continue
+      if (!rec || rec.busy || rec.ctxKey !== ctxKey || rec.acct !== ctx.acct) continue
       if (!usable(rec.sig)) continue
       if (!best || rec.sig.length > best.sent.length) best = { conv, sent: rec.sig }
     }
@@ -861,7 +864,7 @@ function translateRequest(openai, tools, ctx = {}) {
     const fresh = mine.slice(best.sent.length)
     let text = fresh.map((t, i) => (t.role === "tool" && i === fresh.length - 1 ? `${t.text}\n\n${TOOL_REMINDER}` : t.text)).join("\n\n")
     setBusy(best.conv, true) // 在途标记: 并发请求不得复用同一会话
-    return { conv: best.conv, text, sig, fullText, ctxKey, sessionKey: skey }
+    return { conv: best.conv, text, sig, fullText, ctxKey, sessionKey: skey, acct: ctx.acct }
   }
 
   const hist = turns
@@ -874,7 +877,7 @@ function translateRequest(openai, tools, ctx = {}) {
   if (tools.length) parts.push(TOOL_PROTOCOL(tools))
   if (hist) parts.push(`# 对话历史(接续)\n${hist}`)
   parts.push(`# 本轮用户消息\n${last || "(空)"}`)
-  return { conv: "", text: parts.join("\n\n"), sig, fullText, ctxKey, sessionKey: skey }
+  return { conv: "", text: parts.join("\n\n"), sig, fullText, ctxKey, sessionKey: skey, acct: ctx.acct }
 }
 
 // 清言 SSE 事件 → OpenAI chat.completion.chunk。
@@ -1317,7 +1320,7 @@ export async function ChatglmAuthPlugin({ client }) {
               // 非流式(缺省与 stream=false 均走这里): 聚合后回一个 chat.completion
               await pump(first)
               if (stalledRound()) await retryRound()
-              if (sse.conv) remember(sse.conv, req.sig, { ctxKey: req.ctxKey, sessionKey: req.sessionKey })
+              if (sse.conv) remember(sse.conv, req.sig, { ctxKey: req.ctxKey, sessionKey: req.sessionKey, acct: req.acct })
               setBusy(req.conv, false)
               if (!sse.finished) sse.end() // holdEnd 推迟了 end, 这里必须补: 否则 sse.calls 恒为空
               // 尚未向客户端输出任何内容 → 可用 HTTP 错误表达失败(OpenAI 错误体)
@@ -1341,7 +1344,7 @@ export async function ChatglmAuthPlugin({ client }) {
                 sse.onChunk = (chunk) => emitLine(chunk)
                 await pump(first)
                 if (!aborted && !sse.failed && stalledRound()) await retryRound()
-                if (sse.conv) remember(sse.conv, req.sig, { ctxKey: req.ctxKey, sessionKey: req.sessionKey })
+                if (sse.conv) remember(sse.conv, req.sig, { ctxKey: req.ctxKey, sessionKey: req.sessionKey, acct: req.acct })
                 setBusy(req.conv, false) // 清理在途标记(复用分支在 translateRequest 里置位)
                 if (aborted) { try { ctrl.close() } catch {} return } // 客户端已断开: 静默收尾, 不发错误也不发 finish
                 if (!sse.finished) sse.end()

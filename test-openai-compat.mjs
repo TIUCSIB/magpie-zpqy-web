@@ -31,9 +31,10 @@ const plugin = await ChatglmAuthPlugin({ client: { app: { log() {} } } })
 const loader = await plugin.auth.loader(async () => AUTH)
 
 async function call(body, { sessionId = 'sess-default', signal } = {}) {
+  const headers = { 'content-type': 'application/json', ...(sessionId ? { 'x-session-id': sessionId } : {}) }
   return loader.fetch('https://chatglm.cn/chatglm/backend-api/assistant/stream', {
     method: 'POST',
-    headers: { 'content-type': 'application/json', 'x-session-id': sessionId },
+    headers,
     body: JSON.stringify(body),
     signal,
   })
@@ -271,6 +272,21 @@ console.log('[H2] 并发守卫')
   await Promise.all([q2, q3])
   check('busy 在途时并发请求降级为新会话', upstreamCalls[2].conversation_id, '')
   check('在途请求不受影响正常完成', upstreamCalls[1].conversation_id, 'conv-b1')
+}
+
+console.log('[H3] 无会话头降级: 前缀 + 上下文指纹匹配仍生效(0.3.0 回归修复)')
+{
+  upstreamCalls.length = 0
+  globalThis.fetch = async (url, init) => {
+    const body = JSON.parse(init.body)
+    upstreamCalls.push({ conversation_id: body.conversation_id })
+    return sseRes(okUpstream('conv-' + upstreamCalls.length, '你好。'))
+  }
+  const M1 = [{ role: 'user', content: 'H3 独有内容 c1' }]
+  const M2 = [{ role: 'user', content: 'H3 独有内容 c1' }, { role: 'assistant', content: '好的。' }, { role: 'user', content: 'H3 独有内容 c2' }]
+  await call({ model: 'glm-5.3-flash', tools: TOOLS, messages: M1 }, { sessionId: '' })
+  await call({ model: 'glm-5.3-flash', tools: TOOLS, messages: M2 }, { sessionId: '' })
+  check('无会话头 → 前缀+指纹降级复用', upstreamCalls[1].conversation_id, 'conv-1')
 }
 
 // ── I. 采样参数忽略策略 + effort 别名 + tool_choice=required ─────────────
