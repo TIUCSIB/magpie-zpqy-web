@@ -197,5 +197,24 @@ check('收尾前正文还押在 buf 里', carried.text, '我先看看：')
 carried.beginRound()
 check('beginRound 把押着的正文放出去', carried.text, '我先看看：{')
 
+console.log('[16] 上游 error 帧: 要当终止信号, 且不触发续写')
+chunks.length = 0
+s = run([{ status: 'error', last_error: { message: '模型服务异常' } }])
+check('error 也收尾', s.finished, true)
+check('error 记到 sse.error', /模型服务异常/.test(s.error || ''), true)
+check('error 时 finish_reason=stop', chunks.at(-1).choices[0].finish_reason, 'stop')
+
+// holdEnd 下 error 必须终结(否则 pump 永远等不到 roundDone, 还会被误判成空转再补一轮)
+chunks.length = 0
+const errHeld = new ChatglmSSE('glm-5.3', { tools, onChunk: (c) => chunks.push(c) })
+errHeld.holdEnd = true
+errHeld.feed({ status: 'error', last_error: { message: 'boom' } })
+check('holdEnd 下 error 直接终结', errHeld.finished, true)
+check('holdEnd 下 error 不标记 roundDone', errHeld.roundDone, false)
+
+console.log('[17] 退化输出: 超过上限要截断而不是无限收')
+const { MAX_OUTPUT_CHARS } = _internal
+check('上限常量存在且合理', typeof MAX_OUTPUT_CHARS === 'number' && MAX_OUTPUT_CHARS > 100_000, true)
+
 console.log(`\n结果: ${pass} 通过, ${fail} 失败`)
 process.exit(fail ? 1 : 0)

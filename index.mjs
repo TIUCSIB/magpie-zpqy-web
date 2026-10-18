@@ -485,6 +485,8 @@ const TOOL_REMINDER = `# 提示
 const STALL_MAX_LEN = 240
 const STALL_TAIL = /(?:[:：,，、]|\.{2,}|…|——|—|-)\s*$/
 const SENTENCE_END = /[。！？!?~～.”』」）)]\s*$/
+// 模型退化时会原地打转狂吐(实测一次 50 万字 / 上万帧), 超过这个量就没必要再收了
+const MAX_OUTPUT_CHARS = 300_000
 
 function looksStalled(text) {
   const t = String(text || "").trim()
@@ -809,10 +811,13 @@ class ChatglmSSE {
     if (evt.model) this.model = evt.model
     const le = evt.last_error
     if (le && (le.message || le.code)) this.error = String(le.message || le.code)
+    // 上游偶尔用 status=error 收尾(实测: 模型退化时狂吐 50 万字后报错), 必须当终止信号,
+    // 否则 holdEnd 下等不到 finish 帧, 空了会一直挂到连接关闭, 甚至被误判成空转再补一轮。
+    if (evt.status === "error" && !this.error) this.error = le?.intervene_text || "上游返回 error"
     if (evt.status === "intervene") this.intervene = le?.intervene_text || this.error || "内容因合规限制被拦截"
     for (const p of evt.parts || []) this.feedPart(p)
-    if (evt.status === "finish" || evt.status === "intervene") {
-      // holdEnd: 回合结束先记账不终结, 由调用方决定补不补一轮(空转判定要用到 buf)
+    if (evt.status === "finish" || evt.status === "intervene" || evt.status === "error") {
+      // holdEnd: 只有正常 finish 才可能续写; error/intervene 一律终结
       if (this.holdEnd && evt.status === "finish") this.roundDone = true
       else this.end()
     }
@@ -1103,6 +1108,13 @@ export async function ChatglmAuthPlugin({ client }) {
                       try { sse.feed(JSON.parse(line.slice(5).trim())) } catch {}
                     }
                   }
+                  // 退化输出(payload 原地打转)只收前一段就掐掉, 免得把网关和界面一起拖死
+                  if (sse.raw.length + sse.think.length > MAX_OUTPUT_CHARS) {
+                    sse.error = sse.error || `输出异常膨胀(${sse.raw.length + sse.think.length} 字), 已截断`
+                    reader.cancel().catch(() => {})
+                    sse.end()
+                    return
+                  }
                   if (sse.roundDone || sse.finished) { reader.cancel().catch(() => {}); return }
                 }
               } catch (e) {
@@ -1115,6 +1127,7 @@ export async function ChatglmAuthPlugin({ client }) {
             let retried = false
             const stalledRound = () => {
               if (retried) return false
+              if (sse.error && !sse.roundDone) return false // 上游报错/断了: 续写只会再撞一次
               if (parseToolCalls(sse.raw)?.calls?.length) return false // 这一轮已经拿到调用, 不算空转
               if ((sse.text || "").trim().length > STALL_MAX_LEN) return false
               // 工具 JSON 写到一半: 原文里已经有调用痕迹, 解析却没成 → 让它重写一遍
@@ -1224,6 +1237,6 @@ export const _internal = {
   luhnStamp, md5hex, uuid32, signedHeaders, credsOf, parseCookies, translateRequest,
   ChatglmSSE, textOf, remember, convs, findBrowser, jwtIsGuest, browserFlow,
   normalizeTools, parseToolCalls, sliceJsonObject, looseJson, jsonClosed, renderTurn, estimateTokens,
-  looksStalled, repairJson, TOOL_NUDGE, TOOL_NUDGE_BROKEN,
+  looksStalled, repairJson, TOOL_NUDGE, TOOL_NUDGE_BROKEN, MAX_OUTPUT_CHARS,
   HOST, SIGN_SALT, ASSISTANT_ID, VARIANTS,
 }
