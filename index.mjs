@@ -31,8 +31,8 @@ const LABEL = "智谱清言"
 const HOST = "https://chatglm.cn"
 const API = `${HOST}/chatglm` // 所有业务端点的前缀; 漏了它会命中 SPA 首页返回 HTML
 const ASSISTANT_ID = "65940acff94777010aa6b796" // 清言默认助手(普通对话)
-const SIGN_SALT = "8a1317a7468aa3ad86e997d08f3f31cb"
-const UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+const SIGN_SALT = process.env.CHATGLM_SIGN_SALT || "8a1317a7468aa3ad86e997d08f3f31cb"
+const UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0 Safari/537.36"
 const TOKEN_TTL = 2 * 3600_000
 
 const FALLBACK_MODELS = [
@@ -198,12 +198,17 @@ async function memberInfo(creds) {
 }
 
 // 每日登录积分: 领取一次并回报结果(幂等, 已领服务端会拒)。只在真实账号 usage 时顺带做。
+let lastClaimDay = ""
 async function claimDaily(creds) {
+  const today = new Date().toISOString().slice(0, 10)
+  if (today === lastClaimDay) return { status: 2, message: "今日已领(本地记录)" }
   try {
     const res = await fetch(`${API}/member-api/member/daily_login_score`, {
       method: "POST", headers: signedHeaders({ device: creds.device, token: creds.token }), body: "",
     })
     const j = await res.json().catch(() => null)
+    const msg = String(j?.message || "")
+    if (j?.status === 0 || /已|重复|limit|today/i.test(msg)) lastClaimDay = today
     return j // { status, message, result }
   } catch {
     return null
@@ -224,11 +229,10 @@ async function usageOf(creds) {
   if (r.is_guest) return { plan: "游客", user: r.nickname || "guest", windows: [], signIn: "kept" }
   const out = { user: r.nickname || r.username || "", windows: [], signIn: "kept" }
   // member_info 是积分/等级的真正来源(前端 leftScore getter 即读它)
-  let mi = {}
-  try {
-    const m = await memberInfo(creds)
-    mi = m?.result || m || {}
-  } catch {}
+  const pMember = memberInfo(creds).then((m) => m?.result || m || {}).catch(() => ({}))
+  const pActivity = scoreActivity(creds).catch(() => null)
+  const pDaily = claimDaily(creds)
+  let mi = await pMember
   if (!mi.left_score && r.member_info) mi = r.member_info // 回落 user/info 内联
 
   // plan: score_rule 是人话(如「免费用户，登录赠送200积分/天」), 优先它; 否则用等级
@@ -248,13 +252,12 @@ async function usageOf(creds) {
     out.windows.push({ name: "Token 余量", used: 100 - tlp, display: `剩 ${tlp}%` })
   }
   // 每日登录积分: 领一次, 成功(或已领)在卡片上标注
-  const dl = await claimDaily(creds)
+  const dl = await pDaily
   if (dl && dl.status === 0) out.windows.push({ name: "每日登录", used: 0, display: "+200 已领", aside: true })
   else if (dl && /已|重复|limit|today/i.test(String(dl.message || ""))) out.windows.push({ name: "每日登录", used: 0, display: "今日已领", aside: true })
   // 活动积分: status>0 才是真在活动(-2=无活动)
-  try {
-    const sa = await scoreActivity(creds)
-    const s = sa?.result
+  {
+    const s = (await pActivity)?.result
     if (s && s.status > 0 && s.target_score > 0) {
       out.windows.push({
         name: s.title || "活动积分",
@@ -262,7 +265,7 @@ async function usageOf(creds) {
         display: `${s.current_score || 0} / ${s.target_score}`,
       })
     }
-  } catch {}
+  }
   return out
 }
 
@@ -333,31 +336,42 @@ function browserFlow(log, opts = {}) {
     }
     state.child = null
   }
+  process.on("exit", () => cleanup()) // 宿主进程被 kill 时回收调试浏览器, 不留孤儿 Chrome
 
   const start = async () => {
     if (!state.exe) throw new Error("找不到 Chrome/Edge —— 请改用「粘贴 Cookie」方式登录")
-    state.port = 9300 + Math.floor(Math.random() * 500)
     state.profile = path.join(process.env.LOCALAPPDATA || os.homedir(), "magpie-chatglm-auth", "browser")
     fs.mkdirSync(state.profile, { recursive: true })
-    state.child = spawn(state.exe, [
-      `--remote-debugging-port=${state.port}`,
-      `--user-data-dir=${state.profile}`,
-      "--remote-allow-origins=*",
-      "--no-first-run",
-      "--no-default-browser-check",
-      "--disable-sync",
-      "--window-size=520,760",
-      `${HOST}/`,
-    ], { stdio: "ignore", detached: false })
     let version = null
-    for (let i = 0; i < 40; i++) {
-      await sleep(500)
-      try { version = await (await fetch(`http://127.0.0.1:${state.port}/json/version`)).json(); break } catch {}
-      if (state.child.exitCode != null) break
+    // 随机端口可能撞上已占用服务(表现为探测一直失败): 换口重来, 最多 3 次
+    for (let attempt = 0; attempt < 3 && !version; attempt++) {
+      state.port = 9300 + Math.floor(Math.random() * 500)
+      state.child = spawn(state.exe, [
+        `--remote-debugging-port=${state.port}`,
+        `--user-data-dir=${state.profile}`,
+        "--remote-allow-origins=*",
+        "--no-first-run",
+        "--no-default-browser-check",
+        "--disable-sync",
+        "--window-size=520,760",
+        `${HOST}/`,
+      ], { stdio: "ignore", detached: false })
+      for (let i = 0; i < 40; i++) {
+        await sleep(500)
+        try { version = await (await fetch(`http://127.0.0.1:${state.port}/json/version`)).json(); break } catch {}
+        if (state.child.exitCode != null) break
+      }
+      if (!version && state.child.exitCode == null) { try { state.child.kill() } catch {} }
+      if (!version) await sleep(300)
     }
     if (!version) throw new Error("调试端口没起来 —— 若已开着一个同 profile 的窗口, 关掉它再重试")
     const ws = new WebSocket(version.webSocketDebuggerUrl)
-    await new Promise((res, rej) => { ws.onopen = res; ws.onerror = () => rej(new Error("CDP WebSocket 连接失败")) })
+    // 握手超时: 个别环境 onerror 不触发, 不设超时会永远卡在这里
+    await new Promise((res, rej) => {
+      const t = setTimeout(() => rej(new Error("CDP WebSocket 连接超时")), 10_000)
+      ws.onopen = () => { clearTimeout(t); res() }
+      ws.onerror = () => { clearTimeout(t); rej(new Error("CDP WebSocket 连接失败")) }
+    })
     state.ws = ws
   }
 
@@ -478,9 +492,12 @@ ${tools.map((t) => `### ${t.function.name}\n${t.function.description || "(无描
 用户: 你好呀
 回答: 你好!有什么可以帮你的?`
 
-// agent 循环里每一轮都提醒一次: 清言侧历史很长, 协议容易被冲淡
+// agent 循环里每一轮都提醒一次: 清言侧历史很长, 首条消息里的协议容易被冲淡,
+// 而报错重发恰恰发生在循环中段 —— 纪律必须随工具结果每轮重钉一遍
 const TOOL_REMINDER = `# 提示
-还需要工具就继续按协议输出 {"tool_calls":[...]};任务已完成就用自然语言给出最终回答。`
+还需要工具就继续按协议输出 {"tool_calls":[...]};任务已完成就用自然语言给出最终回答。
+按工具描述选工具: 本地文件/shell 命令一律用对应的本地工具, 描述带「网页/浏览/打开链接」的工具不要拿来执行命令或读文件。
+上一个调用报错后绝不允许原样重发: 相同的输入只会得到相同的错误, 换参数或换工具再试。`
 
 // 模型偶尔只写一句引导语(常以冒号结尾)就结束这一轮 —— 清言侧 status=finish, 网关侧看不到任何
 // 工具调用, agent 循环就地停住, 界面上就只剩「…一次做完（加常量、替换两处、升版本）：」。
@@ -510,6 +527,21 @@ const TOOL_NUDGE_BROKEN = `# 注意
 你上一条回复里的工具调用 JSON 不完整或不合法(常见原因: 字符串里直接写了换行, 或输出被截断), 无法执行。
 请重新完整输出一次: 所有参数值都在同一行内, 代码里的换行写成 \\n(反斜杠 + n), 不要用真实换行。
 格式: {"tool_calls":[{"name":"工具名","arguments":{...}}]}`
+
+// 工具结果文本像不像报错。宽松匹配: 误报的代价只是多提醒一句/多拦一次重发, 漏报则毫无防护
+const TOOL_ERR_RE = /(error|failed|fatal|cannot|could not|can't|not found|no such|invalid|denied|refused|traceback|exception|ENOENT|EACCES|EPERM|EISDIR|exit code [1-9])|报错|失败|无法|权限|拒绝/i
+
+// 报错轮的强化提醒: TOOL_PROTOCOL 只注入首条消息, 会话复用后长历史会把它冲淡,
+// 所以报错发生的当轮要把「禁止原样重发」重新钉一遍
+const TOOL_ERR_REMINDER = `# 注意: 上面的工具执行结果里有报错
+报错的调用绝不允许原样重发 —— 相同的输入只会得到相同的错误。
+修正参数、换用更合适的工具(本地文件/命令用本地工具, 网页类工具只用于打开链接), 或者向用户说明情况并给出最终回答。`
+
+// 模型把「刚报错的调用」原样又输出一遍时的续写轮: 点名这个调用, 要求换做法
+const TOOL_NUDGE_REPEAT = `# 注意: 你刚才原样重发了一个刚报错的调用
+那次调用不会被执行 —— 相同的输入只会得到相同的错误。
+这一轮必须换做法: 修正参数、改用更合适的工具(本地文件/命令用本地工具, 描述带「网页/浏览/打开链接」的工具不要用来读文件或执行命令),
+或者不再调用工具, 用完整的句子向用户说明情况并给出最终回答。`
 
 // 工具定义归一到 OpenAI 形状(顺带吃下 Anthropic 风格的 {name, input_schema})
 function normalizeTools(tools) {
@@ -651,10 +683,10 @@ function parseToolCalls(raw) {
     const call = parseToolTag(m[1])
     if (call) groups.push({ at: m.index, len: m[0].length, calls: [call] })
   }
-  const fence = s.match(/```[a-zA-Z]*\s*([\s\S]*?)\s*```/)
+  const fences = [...s.matchAll(/```[a-zA-Z]*\s*([\s\S]*?)\s*```/g)].map((m) => m[1]) // 全部围栏: 第一个可能是示例, 真调用在后面
   if (!groups.length) {
     // 提示词协议要求的 {"tool_calls":[...]}(裸 JSON / 代码围栏 / 单数 tool_call 都认)
-    for (const body of [fence && fence[1], s]) {
+    for (const body of [...fences, s]) {
       if (!body) continue
       const frag = sliceJsonObject(body, "tool_calls") || sliceJsonObject(body, "tool_call")
       if (!frag) continue
@@ -669,7 +701,7 @@ function parseToolCalls(raw) {
   }
   if (!groups.length) {
     // 兜底: 整段就是一个调用, 或就是调用数组
-    const body = (fence && fence[1] || s).trim()
+    const body = (fences[0] || s).trim()
     if (body.startsWith("{") || body.startsWith("[")) {
       const parsed = looseJson(body)
       const list = Array.isArray(parsed) ? parsed : parsed?.name || parsed?.tool_name ? [parsed] : []
@@ -727,6 +759,45 @@ function renderTurn(m) {
   return { role, text: textOf(m.content) }
 }
 
+// 调用指纹: 名字 + 规范化参数(键排序)。同一调用的不同写法(字符串/对象/键序不同)要判等
+function canonArgs(v) {
+  if (Array.isArray(v)) return v.map(canonArgs)
+  if (v && typeof v === "object") {
+    const o = {}
+    for (const k of Object.keys(v).sort()) o[k] = canonArgs(v[k])
+    return o
+  }
+  return v
+}
+function callKey(name, args) {
+  const a = typeof args === "string" ? looseJson(args) ?? args.trim() : args ?? {}
+  let s
+  try { s = JSON.stringify(canonArgs(a)) } catch { s = String(a) }
+  return `${name} ${s}`
+}
+
+// 历史里「结果像报错」的调用 → 指纹集合。出站时模型又吐出同样的调用就是原样重发:
+// 拦下来换成点名续写轮, 免得把客户端每轮的调用上限烧在注定失败的重复执行上(实测: 连错三次整轮报废)
+function failedCallKeys(messages) {
+  const out = new Set()
+  const msgs = Array.isArray(messages) ? messages : []
+  for (let i = 0; i < msgs.length; i++) {
+    const m = msgs[i]
+    const calls = m?.role === "assistant" && Array.isArray(m.tool_calls) ? m.tool_calls.filter((c) => c?.function?.name || c?.name) : []
+    if (!calls.length) continue
+    const results = []
+    for (let j = i + 1; j < msgs.length && msgs[j]?.role === "tool"; j++) results.push(msgs[j])
+    for (const c of calls) {
+      const name = c.function?.name || c.name
+      const r = results.find((x) => x?.tool_call_id && x.tool_call_id === c?.id)
+        || results.find((x) => (x?.name || x?.tool_name) === name)
+        || results[0]
+      if (r && TOOL_ERR_RE.test(textOf(r.content))) out.add(callKey(name, c.function?.arguments ?? c.arguments))
+    }
+  }
+  return out
+}
+
 // 决定 conversation_id 与要发送的清言用户文本。
 // 复用: 已发出的「我方回合」(user + 工具结果) 是本次的前缀 → 只补发新增的那些;
 //       中间的 assistant 回合不算 —— 那是清言服务端自己生成的。
@@ -737,6 +808,7 @@ function translateRequest(openai, tools) {
   const turns = msgs.filter((m) => m.role !== "system" && m.role !== "developer").map(renderTurn)
   const mine = turns.filter((t) => t.role !== "assistant")
   const sig = mine.map((t) => md5hex(t.text))
+  const blocked = failedCallKeys(msgs)
   // 计账用的完整上下文: 系统提示 + 工具清单 + 全部回合(含 assistant)。与实际发什么无关 ——
   // 发的是增量还是全量只是传输方式, 客户端的上下文总量是一样的。
   const fullText = [sys && `# 系统指令(必须遵循)\n${sys}`, tools.length && TOOL_PROTOCOL(tools), ...turns.map((t) => t.text)].filter(Boolean).join("\n\n")
@@ -750,8 +822,11 @@ function translateRequest(openai, tools) {
   }
   if (best && sig.length > best.sent.length) {
     const fresh = mine.slice(best.sent.length)
+    // 这轮要发的工具结果里有报错 → 把「禁止原样重发」在当轮消息里重新钉一遍
+    const errored = fresh.some((t) => t.role === "tool" && TOOL_ERR_RE.test(t.text))
     let text = fresh.map((t, i) => (t.role === "tool" && i === fresh.length - 1 ? `${t.text}\n\n${TOOL_REMINDER}` : t.text)).join("\n\n")
-    return { conv: best.conv, text, sig, fullText }
+    if (errored) text += `\n\n${TOOL_ERR_REMINDER}`
+    return { conv: best.conv, text, sig, fullText, blocked }
   }
 
   const hist = turns
@@ -764,7 +839,9 @@ function translateRequest(openai, tools) {
   if (tools.length) parts.push(TOOL_PROTOCOL(tools))
   if (hist) parts.push(`# 对话历史(接续)\n${hist}`)
   parts.push(`# 本轮用户消息\n${last || "(空)"}`)
-  return { conv: "", text: parts.join("\n\n"), sig, fullText }
+  // 重开会话时历史全量内联, 只看最近几条工具结果, 太久的报错不再提醒
+  if (turns.slice(-6).some((t) => t.role === "tool" && TOOL_ERR_RE.test(t.text))) parts.push(TOOL_ERR_REMINDER)
+  return { conv: "", text: parts.join("\n\n"), sig, fullText, blocked }
 }
 
 // 清言 SSE 事件 → OpenAI chat.completion.chunk。
@@ -775,6 +852,9 @@ class ChatglmSSE {
     this.id = "chatglm-" + uuid32()
     this.model = model
     this.tools = Array.isArray(opts.tools) ? opts.tools : []
+    // 报错过的调用指纹(translateRequest 从历史提取): 出站时防「原样重发刚报错的调用」
+    this.blocked = opts.blockedCalls instanceof Set ? opts.blockedCalls : new Set()
+    this.repeatNudged = false
     this.onChunk = opts.onChunk || (() => {})
     this.conv = ""
     this.text = "" // 已发出的正文(工具 JSON 不在内)
@@ -880,10 +960,17 @@ class ChatglmSSE {
     this.finished = true
     if (this.buf) { const b = this.buf; this.buf = ""; this.emitContent(b) }
     const parsed = this.tools.length ? parseToolCalls(this.raw) : null
-    if (parsed?.calls.length) {
+    let calls = parsed?.calls ?? []
+    // 原样重发刚报错的调用: 混在新调用里就只丢重发的, 新调用照常执行;
+    // 整轮都是重发则放行(续写轮只有一次, 已在 handler 里给过机会, 客户端每轮上限兜底)
+    if (calls.length && this.blocked.size) {
+      const kept = calls.filter((c) => !this.blocked.has(callKey(c.function?.name || c?.name, c.function?.arguments)))
+      if (kept.length) calls = kept
+    }
+    if (calls.length) {
       // 整个 tool_calls 一次性给出(与 HelloGML 同策略: 解析要等正文收完才准)
-      parsed.calls.forEach((c, i) => this.emit({ tool_calls: [{ index: i, id: c.id, type: "function", function: { name: c.function.name, arguments: c.function.arguments } }] }))
-      this.calls = parsed.calls
+      calls.forEach((c, i) => this.emit({ tool_calls: [{ index: i, id: c.id, type: "function", function: { name: c.function.name, arguments: c.function.arguments } }] }))
+      this.calls = calls
       return this.emit({}, "tool_calls")
     }
     const note = this.intervene || this.error
@@ -907,6 +994,7 @@ function accumulate(st, field, incoming, full) {
 
 export async function ChatglmAuthPlugin({ client }) {
   const log = (m) => { try { client?.app?.log?.({ body: { service: "chatglm-auth", level: "error", message: m } }) } catch {} }
+  const DEBUG = !!process.env.CHATGLM_DEBUG // 排障: 打请求摘要与上游 SSE 帧样本(协议漂移时对照抓包用)
 
   return {
     config: async (cfg) => {
@@ -1031,6 +1119,7 @@ export async function ChatglmAuthPlugin({ client }) {
             effort = String(openai.reasoning_effort || openai.reasoningEffort || openai.effort || effort || "").toLowerCase()
             if (!EFFORTS.includes(effort)) effort = DEFAULT_EFFORT
             const mode = EFFORT_TO_META[effort]
+            if (DEBUG) log(`chat <- msgs=${openai.messages?.length ?? 0} tools=${tools.length} effort=${effort} model=${model} conv=${req.conv || "(new)"} text=${req.text.length}ch`)
             const glmBody = (text, convId) => JSON.stringify({
               assistant_id: ASSISTANT_ID,
               conversation_id: convId,
@@ -1062,7 +1151,18 @@ export async function ChatglmAuthPlugin({ client }) {
                   res = null
                 }
                 // 只重试「没建起来」的请求: 流已经开始就不能重来(会双份输出)
-                if (res?.ok) break
+                if (res?.ok) {
+                  // 风控/改版页也是 200: content-type 不是 SSE 就别当流收, 否则零输出会被误判成空转、白烧一轮续写
+                  const ct = res.headers.get("content-type") || ""
+                  if (ct && !/text\/event-stream/i.test(ct)) {
+                    const t = await res.text().catch(() => "")
+                    const e = new Error(/verify|captcha|slider|安全验证|滑块/i.test(t) ? "清言风控限流(返回人机验证页), 请降低请求频率后重试" : `清言返回非 SSE 响应(${ct}), 协议可能已改版`)
+                    e.status = 502
+                    e.signIn = "kept"
+                    throw e
+                  }
+                  break
+                }
                 if (res && res.status < 500) break
                 if (attempt === 0) await new Promise((r) => setTimeout(r, 1200))
               }
@@ -1093,8 +1193,8 @@ export async function ChatglmAuthPlugin({ client }) {
             }
 
             const keepHeaders = { "content-type": "text/event-stream; charset=utf-8", "cache-control": "no-cache", "x-magpie-sign-in": "kept" }
-            const sse = new ChatglmSSE(model, { tools })
-            sse.holdEnd = true // finish 帧只标记回合结束; 空转时还要补一轮
+            const sse = new ChatglmSSE(model, { tools, blockedCalls: req.blocked })
+            sse.holdEnd = true // finish 帧只标记回合结束; 空转/重发时还要补一轮
 
             // 清言不返回 usage → 估算, 否则网关按 0 记账显示「还没用过」。
             // prompt 按客户端完整上下文估(系统提示+全部历史+工具清单), 不能按 req.text:
@@ -1123,6 +1223,7 @@ export async function ChatglmAuthPlugin({ client }) {
                     const line = buf.slice(0, i).replace(/\r$/, "")
                     buf = buf.slice(i + 1)
                     if (line.startsWith("data:")) {
+                      if (DEBUG) log(`sse <- ${line.slice(5, 410)}`)
                       try { sse.feed(JSON.parse(line.slice(5).trim())) } catch {}
                     }
                   }
@@ -1152,9 +1253,20 @@ export async function ChatglmAuthPlugin({ client }) {
               // 工具 JSON 写到一半: 原文里已经有调用痕迹, 解析却没成 → 让它重写一遍
               return TOOL_MARK.test(sse.raw) ? true : looksStalled(sse.text)
             }
-            const retryRound = async () => {
+            // 整轮都是「原样重发刚报错的调用」→ 补一轮点名提醒(与空转共用每请求一次的预算),
+            // 续写后仍重发就放行, 由客户端的每轮调用上限兜底
+            const repeatStalled = () => {
+              if (retried || sse.repeatNudged) return false
+              if (sse.finished || (sse.error && !sse.roundDone)) return false
+              if (!req.blocked?.size) return false
+              const calls = parseToolCalls(sse.raw)?.calls ?? []
+              if (!calls.length || !calls.every((c) => req.blocked.has(callKey(c.function?.name || c?.name, c.function?.arguments)))) return false
+              sse.repeatNudged = true
+              return true
+            }
+            const retryRound = async (nudgeOverride) => {
               retried = true
-              const nudge = TOOL_MARK.test(sse.raw) ? TOOL_NUDGE_BROKEN : TOOL_NUDGE
+              const nudge = nudgeOverride || (TOOL_MARK.test(sse.raw) ? TOOL_NUDGE_BROKEN : TOOL_NUDGE)
               let res = null
               try {
                 res = await startRound(nudge, sse.conv || req.conv)
@@ -1170,7 +1282,10 @@ export async function ChatglmAuthPlugin({ client }) {
               // 非流式: 聚合后回一个 chat.completion
               await pump(first)
               if (stalledRound()) await retryRound()
+              else if (repeatStalled()) await retryRound(TOOL_NUDGE_REPEAT)
               if (sse.conv) remember(sse.conv, req.sig)
+              // 不跑 end() 的话 sse.calls 恒空、缓冲正文也不放行 —— 非流式工具调用全废(0.3.0 修过又随回滚丢失, 单独重落)
+              if (!sse.finished) sse.end()
               const msg = sse.calls
                 ? { role: "assistant", content: sse.text || null, tool_calls: sse.calls }
                 : { role: "assistant", content: sse.text || `[chatglm] 空回复${sse.error ? `: ${sse.error}` : ""}` }
@@ -1186,9 +1301,15 @@ export async function ChatglmAuthPlugin({ client }) {
             const out = new ReadableStream({
               async start(ctrl) {
                 sse.onChunk = (chunk) => ctrl.enqueue(enc.encode("data: " + JSON.stringify(chunk) + "\n\n"))
-                await pump(first)
-                if (stalledRound()) await retryRound()
+                // 心跳: deep_thinking 首字可 70s+, 中间层普遍 60-120s 空闲就掐; SSE 注释帧按规范被客户端忽略
+                const ping = setInterval(() => { try { ctrl.enqueue(enc.encode(": ping\n\n")) } catch { clearInterval(ping) } }, 15000)
+                try {
+                  await pump(first)
+                  if (stalledRound()) await retryRound()
+                  else if (repeatStalled()) await retryRound(TOOL_NUDGE_REPEAT)
+                } finally { clearInterval(ping) }
                 if (sse.conv) remember(sse.conv, req.sig)
+                if (DEBUG) log(`chat -> conv=${sse.conv || "?"} text=${sse.text.length}ch think=${sse.think.length}ch calls=${sse.calls?.length ?? 0}${sse.error ? ` err=${sse.error}` : ""}`)
                 if (!sse.finished) sse.end()
                 // 标准 OpenAI 流式 usage 尾块(choices 空)
                 ctrl.enqueue(enc.encode("data: " + JSON.stringify({ id: sse.id, object: "chat.completion.chunk", created: Math.floor(Date.now() / 1000), model: sse.model, choices: [], usage: usageEstimate() }) + "\n\n"))
@@ -1257,5 +1378,6 @@ export const _internal = {
   ChatglmSSE, textOf, remember, convs, findBrowser, jwtIsGuest, browserFlow,
   normalizeTools, parseToolCalls, sliceJsonObject, looseJson, jsonClosed, renderTurn, estimateTokens,
   looksStalled, repairJson, TOOL_NUDGE, TOOL_NUDGE_BROKEN, MAX_OUTPUT_CHARS,
+  callKey, failedCallKeys, TOOL_ERR_RE, TOOL_ERR_REMINDER, TOOL_NUDGE_REPEAT,
   HOST, SIGN_SALT, ASSISTANT_ID, VARIANTS,
 }

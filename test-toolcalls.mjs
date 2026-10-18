@@ -223,5 +223,75 @@ tr.truncated = true
 tr.end()
 check('截断的输出 finish_reason=length', chunks.at(-1).choices[0].finish_reason, 'length')
 
+console.log('[19] 原样重发拦截: 报错调用的指纹')
+const { callKey, failedCallKeys, TOOL_ERR_RE, TOOL_NUDGE_REPEAT } = _internal
+// 指纹: 同名同参的不同写法要判等, 参数不同要判不等
+check('字符串参数与对象参数判等', callKey('bash', '{"command":"ls -la"}'), callKey('bash', { command: 'ls -la' }))
+check('键序不同判等', callKey('edit', '{"a":1,"b":2}'), callKey('edit', { b: 2, a: 1 }))
+check('参数不同判不等', callKey('bash', { command: 'ls' }) === callKey('bash', { command: 'pwd' }), false)
+// 历史里只有「结果像报错」的调用才进黑名单
+const hist = [
+  { role: 'user', content: '看看' },
+  { role: 'assistant', content: null, tool_calls: [
+    { id: 'c1', function: { name: 'open_url', arguments: '{"url":"file:///F:/x"}' } },
+    { id: 'c2', function: { name: 'bash', arguments: '{"command":"ls"}' } },
+  ] },
+  { role: 'tool', tool_call_id: 'c1', name: 'open_url', content: 'Error: 该工具只支持 http(s) 链接' },
+  { role: 'tool', tool_call_id: 'c2', name: 'bash', content: 'a.ts b.ts' },
+]
+const blockedHist = failedCallKeys(hist)
+check('报错的调用进黑名单', blockedHist.has(callKey('open_url', { url: 'file:///F:/x' })), true)
+check('成功的调用不进黑名单', blockedHist.has(callKey('bash', { command: 'ls' })), false)
+
+console.log('[20] 报错轮: 纪律要在当轮消息里重新钉一遍(防协议被长历史冲淡)')
+convs.clear()
+const e1 = translateRequest({ messages: [{ role: 'user', content: '看看项目' }] }, tools)
+remember('conv-1', e1.sig)
+const e2 = translateRequest({ messages: [
+  { role: 'user', content: '看看项目' },
+  { role: 'assistant', content: null, tool_calls: [{ id: 'c1', function: { name: 'open_url', arguments: '{"url":"file:///F:/x"}' } }] },
+  { role: 'tool', tool_call_id: 'c1', name: 'open_url', content: 'Error: 该工具只支持 http(s) 链接' },
+] }, tools)
+check('复用会话', e2.conv, 'conv-1')
+check('报错轮带强化提醒', /报错的调用绝不允许原样重发/.test(e2.text), true)
+check('报错轮带每轮提醒', /还需要工具/.test(e2.text), true)
+check('带重发拦截黑名单', e2.blocked.has(callKey('open_url', { url: 'file:///F:/x' })), true)
+const e3 = translateRequest({ messages: [
+  { role: 'user', content: '看看项目' },
+  { role: 'assistant', content: null, tool_calls: [{ id: 'c1', function: { name: 'bash', arguments: '{"command":"ls"}' } }] },
+  { role: 'tool', tool_call_id: 'c1', name: 'bash', content: 'a.ts b.ts' },
+] }, tools)
+check('无报错不带强化提醒', /报错的调用绝不允许原样重发/.test(e3.text), false)
+check('每轮提醒仍带纪律行', /绝不允许原样重发/.test(e3.text), true)
+check('TOOL_ERR_RE 识别英文报错', TOOL_ERR_RE.test('Error: file not found'), true)
+check('TOOL_ERR_RE 识别中文报错', TOOL_ERR_RE.test('命令执行失败, exit code 1'), true)
+check('TOOL_ERR_RE 不咬普通输出', TOOL_ERR_RE.test('a.ts b.ts c.ts'), false)
+
+console.log('[21] SSE 出站: 混在新调用里的重发要被丢掉')
+const blockedSet = new Set([callKey('open_url', { url: 'file:///F:/x' })])
+chunks.length = 0
+const both = '{"tool_calls":[{"name":"open_url","arguments":{"url":"file:///F:/x"}},{"name":"bash","arguments":{"command":"ls"}}]}'
+s = run([
+  { status: 'init', parts: [{ logic_id: 'p1', status: 'init', content: [{ type: 'text', text: both }] }] },
+  { status: 'finish', parts: [{ logic_id: 'p1', status: 'finish', content: [{ type: 'text', text: both }] }] },
+], { tools, blockedCalls: blockedSet })
+check('只发新调用', s.calls.map((c) => c.function.name), ['bash'])
+check('index 重排连续', chunks.filter((c) => c.choices[0].delta.tool_calls)[0].choices[0].delta.tool_calls[0].index, 0)
+check('finish_reason=tool_calls', chunks.at(-1).choices[0].finish_reason, 'tool_calls')
+
+console.log('[22] SSE 出站: 整轮都是重发 → 放行(续写预算只有一次, 客户端上限兜底)')
+chunks.length = 0
+const repeat = '{"tool_calls":[{"name":"open_url","arguments":{"url":"file:///F:/x"}}]}'
+s = run([
+  { status: 'init', parts: [{ logic_id: 'p1', status: 'init', content: [{ type: 'text', text: repeat }] }] },
+  { status: 'finish', parts: [{ logic_id: 'p1', status: 'finish', content: [{ type: 'text', text: repeat }] }] },
+], { tools, blockedCalls: blockedSet })
+check('仍给出调用由客户端兜底', s.calls.map((c) => c.function.name), ['open_url'])
+check('点名续写轮就绪', /原样重发/.test(TOOL_NUDGE_REPEAT) && /换做法/.test(TOOL_NUDGE_REPEAT), true)
+
+console.log('[23] 多围栏: 示例围栏在前, 真调用在正文里')
+check('跳过不含 tool_calls 的围栏', callsOf('示例:\n```json\n{"name":"demo","arguments":{}}\n```\n{"tool_calls":[{"name":"bash","arguments":{"command":"ls"}}]}'), [['bash', '{"command":"ls"}']])
+check('围栏+裸调用并存仍可解析', callsOf('```text\n随便什么\n```\n{"tool_calls":[{"name":"a","arguments":{}}]}'), [['a', '{}']])
+
 console.log(`\n结果: ${pass} 通过, ${fail} 失败`)
 process.exit(fail ? 1 : 0)
