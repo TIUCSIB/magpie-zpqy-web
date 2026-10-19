@@ -1,0 +1,24 @@
+# 纯逻辑回归: 工具调用解析 / 回合终态 / 会话隔离 / 登录流程判定。
+# 全部 mock 网络 —— 不配置清言凭据, 不跑 test:live(会消耗积分)。
+name: test
+
+on:
+  push:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22' # package.json engines: >=22
+          # 无 package-lock.json: 不启用缓存, 安装走 npm install(当前零依赖, 实为 no-op)
+      - run: npm install --no-audit --no-fund
+      - run: npm test
