@@ -3,7 +3,7 @@
 // usage 门控、会话提交条件。不联网、不消耗清言积分。
 import { ChatglmAuthPlugin, _internal } from './index.mjs'
 
-const { convs, remember, ROUND, MAX_OUTPUT_CHARS, checkToolCall } = _internal
+const { convs, dirty, remember, ROUND, MAX_OUTPUT_CHARS, checkToolCall, quarantine } = _internal
 
 let pass = 0, fail = 0
 const check = (label, got, want) => {
@@ -622,6 +622,145 @@ convs.clear()
   script = [sseResp(thinkSse)]
   const s = await callStream({ ...thinkJson, stream: true }, {})
   check('流式则透传 reasoning_content', s.raw.includes('内部推理过程'), true)
+}
+
+console.log('\n[F1] 上游 5xx 重试一次后成功')
+convs.clear()
+glmCalls.length = 0
+script = [
+  new Response('{"error":"overloaded"}', { status: 500, headers: { 'content-type': 'application/json' } }),
+  sseResp(frame({ conversation_id: 'cv', status: 'init', parts: [{ logic_id: 'p', status: 'init', content: [{ type: 'text', text: '好了。' }] }] }) + okFinishFrame('好了。')),
+]
+r = await callJson(userMsg())
+check('第二次成功 → 200', r.res.status, 200)
+check('上游共请求 2 次(重试一次)', glmCalls.length, 2)
+check('正文正常', r.json.choices[0].message.content, '好了。')
+
+console.log('\n[F2] 上游 5xx 重试耗尽 → 502, 无第三次')
+convs.clear()
+glmCalls.length = 0
+script = [
+  new Response('{"error":"overloaded"}', { status: 503, headers: { 'content-type': 'application/json' } }),
+  new Response('{"error":"overloaded"}', { status: 503, headers: { 'content-type': 'application/json' } }),
+]
+r = await callJson(userMsg())
+check('上游状态透传 → 503', r.res.status, 503)
+check('只请求 2 次(有上限)', glmCalls.length, 2)
+check('错误体带状态码', r.json?.error?.code, '503')
+
+console.log('\n[F3] 读空闲超时 → interrupted(挂起流不再无界等待)')
+convs.clear()
+process.env.CHATGLM_IDLE_TIMEOUT_MS = '300'
+{
+  // 首帧后永远 hang(不 abort 不 EOF) —— 空闲计时器必须判死。
+  // 流要接上 signal: 超时后 ctrl.abort() 让 pull 以 EOF 结束(与真实 fetch 的 body 行为一致)
+  const hangAfterInit = (signal) => new Response(new ReadableStream({
+    start(c) { c.enqueue(new TextEncoder().encode(frame({ conversation_id: 'cv', status: 'init', parts: [{ logic_id: 'p', status: 'init', content: [{ type: 'text', text: '开头' }] }] }))) },
+    pull(c) {
+      return new Promise((res) => {
+        const fin = () => { c.close(); res() }
+        if (signal?.aborted) return fin()
+        signal?.addEventListener('abort', fin, { once: true })
+      })
+    },
+  }), { headers: { 'content-type': 'text/event-stream' } })
+  script = [hangAfterInit] // 工厂: mock 会传 init.signal 进来
+  const t0 = Date.now()
+  r = await callJson(userMsg())
+  const el = Date.now() - t0
+  check('超时后返回 502(非无限挂起)', r.res.status, 502)
+  check('耗时接近超时值(±1.5s)', el >= 250 && el <= 1800, true)
+  check('code=stream_interrupted', r.json?.error?.code, 'stream_interrupted')
+  check('message 说明无响应', /无响应/.test(r.json?.error?.message || ''), true)
+  check('超时轮不提交会话', convs.size, 0)
+}
+delete process.env.CHATGLM_IDLE_TIMEOUT_MS
+
+console.log('\n[F4] 内部异常路径: busy 必释放 + 快照隔离 + 500 错误体(非 broken stream)')
+convs.clear()
+{
+  // 先建一个可复用的完成会话
+  script = [sseResp(frame({ conversation_id: 'cvX', status: 'init', parts: [{ logic_id: 'p', status: 'init', content: [{ type: 'text', text: '好的。' }] }] }) + okFinishFrame('好的。'))]
+  await callJson(userMsg())
+  const cvX = [...convs.keys()][0]
+  check('前置: cvX 已提交', !!cvX, true)
+  // 复用请求: 第二轮历史 + 一个 getReader 即抛的畸形 Response → pump 首行抛意外异常
+  const boom = { ok: true, status: 200, headers: { get: () => 'text/event-stream' }, body: { getReader() { throw new Error('mock boom') } } }
+  script = [boom]
+  glmCalls.length = 0
+  const r2 = await callJson({ model: 'glm-5.3-flash', messages: [{ role: 'user', content: '你好' }, { role: 'assistant', content: '好的。' }, { role: 'user', content: '继续' }] })
+  check('降级为 500 错误体', r2.res.status, 500)
+  check('code=internal_error', r2.json?.error?.code, 'internal_error')
+  check('复用请求的意外异常 → 快照被隔离', convs.get(cvX)?.quarantined, true)
+  check('busy 已释放(不卡死)', convs.get(cvX)?.busy, 0)
+  check('未重放整轮', glmCalls.length, 1)
+}
+
+console.log('\n[F5] sweep 节流: 纯读取请求也触发过期清理')
+convs.clear(); dirty.clear()
+{
+  script = [sseResp(frame({ conversation_id: 'cvS', status: 'init', parts: [{ logic_id: 'p', status: 'init', content: [{ type: 'text', text: '好的。' }] }] }) + okFinishFrame('好的。'))]
+  await callJson(userMsg())
+  const cvS = [...convs.keys()][0]
+  quarantine(cvS, 'test')
+  convs.get(cvS).ts = Date.now() - 25 * 3600_000
+  dirty.set('dirty-old', Date.now() - 2 * 3600_000)
+  _internal.setLastSweepAt(0) // 重置节流窗口, 模拟已过 60s
+  // 一次纯匹配读取(坏请求 → 400 也走 translateRequest 之前? 不, 400 在 translate 前。用正常请求但让上游失败)
+  script = [new Error('x'), new Error('x')]
+  await callJson(userMsg({ stream: false }))
+  check('过期隔离记录被节流 sweep 删除', convs.has(cvS), false)
+  check('过期 dirty 被清', dirty.has('dirty-old'), false)
+}
+
+console.log('\n[G2] 每请求摘要日志: 字段齐全 + 六类可区分 + 零敏感信息')
+{
+  const logs = []
+  const p2 = await ChatglmAuthPlugin({ client: { app: { log: (x) => logs.push(x.body) } } })
+  const l2 = await p2.auth.loader(async () => AUTH)
+  const call2 = async (body) => {
+    const res = await l2.fetch('https://chatglm.cn/chatglm/backend-api/assistant/stream', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) })
+    await res.text()
+    return res
+  }
+  const done = () => logs.filter((x) => x.message.startsWith('chat done'))
+  convs.clear()
+  // completed
+  script = [sseResp(frame({ conversation_id: 'cv', status: 'init', parts: [{ logic_id: 'p', status: 'init', content: [{ type: 'text', text: '好了。' }] }] }) + okFinishFrame('好了。'))]
+  await call2(userMsg())
+  const d1 = done().at(-1)
+  check('有摘要行', !!d1, true)
+  check('level=info(正常摘要不标红)', d1.level, 'info')
+  check('字段齐全', ['id=', 'status=', 'conv=', 'reason=', 'rebuild=', 'ms=', 'ttfb=', 'retries=', 'upstream=', 'in=', 'out=', 'calls='].every((k) => d1.message.includes(k)), true)
+  check('reason=stop rebuild=reuse|new', /reason=stop/.test(d1.message) && /rebuild=(reuse|new)/.test(d1.message), true)
+  check('ttfb 已计时(≥0)', /ttfb=\d+/.test(d1.message), true)
+  // 六类终态可区分: upstream_error / interrupted / incomplete / cancelled / length / ctx-changed 重建
+  script = [sseResp(frame({ status: 'error', last_error: { message: 'boom' } }))]
+  await call2(userMsg())
+  check('reason=upstream_error', /reason=upstream_error/.test(done().at(-1).message), true)
+  script = [sseRespSeq([frame({ conversation_id: 'cv', status: 'init', parts: [{ logic_id: 'p', status: 'init', content: [{ type: 'text', text: '甲' }] }] })], { throwAfter: 1 })]
+  await call2(userMsg())
+  check('reason=interrupted', /reason=interrupted/.test(done().at(-1).message), true)
+  script = [sseRespSeq([frame({ conversation_id: 'cv', status: 'init', parts: [{ logic_id: 'p', status: 'init', content: [{ type: 'text', text: '甲' }] }] })])]
+  await call2(userMsg())
+  check('reason=incomplete', /reason=incomplete/.test(done().at(-1).message), true)
+  {
+    const ac = new AbortController(); ac.abort()
+    await l2.fetch('https://chatglm.cn/chatglm/backend-api/assistant/stream', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(userMsg()), signal: ac.signal }).then((x) => x.text())
+    check('reason=cancelled', /reason=cancelled/.test(done().at(-1).message), true)
+  }
+  // ctx-changed 重建原因: 完成会话后改 sys(第一轮帧必须带 conv id 才会提交映射)
+  convs.clear()
+  script = [sseResp(frame({ conversation_id: 'cvCtx', status: 'finish', parts: [{ logic_id: 'p', status: 'finish', content: [{ type: 'text', text: '好了。' }] }] }))]
+  await call2({ model: 'glm-5.3-flash', messages: [{ role: 'system', content: 'S1' }, { role: 'user', content: '你好' }] })
+  check('前置: sys1 会话已提交', convs.has('cvCtx'), true)
+  script = [sseResp(frame({ conversation_id: 'cvCtx2', status: 'finish', parts: [{ logic_id: 'p', status: 'finish', content: [{ type: 'text', text: '好了。' }] }] }))]
+  await call2({ model: 'glm-5.3-flash', messages: [{ role: 'system', content: 'S2-变了' }, { role: 'user', content: '你好' }] })
+  check('rebuild=ctx-changed 可辨识', /rebuild=ctx-changed/.test(done().at(-1).message), true)
+  // 隐私红线: 摘要行不含正文/提示词/token
+  const doneLines = done().map((x) => x.message).join('\n')
+  check('摘要不含测试 token', doneLines.includes('test-token'), false)
+  check('摘要不含用户消息与系统提示正文', doneLines.includes('你好') || doneLines.includes('S2-变了') || doneLines.includes('好了。'), false)
 }
 
 restoreFetch()
