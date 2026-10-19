@@ -19,9 +19,11 @@ const loader = await plugin.auth.loader(async () => AUTH)
 let script = []   // 每个元素 = 一轮上游的返回值: Response、错误、或 (signal)=>Response 的工厂
 let glmCalls = [] // 记录发给上游的清言请求体
 let glmIntercept = null // 测试自定义的上游行为(优先于 script)
+let passthrough = []    // 非对话透传请求(GET 探测/非聊天端点): {url, method}
 const realFetch = globalThis.fetch
 const mockFetch = async (url, init) => {
-  if (String(url).includes('/assistant/stream')) {
+  const u = String(url)
+  if (u.includes('/assistant/stream')) {
     glmCalls.push(JSON.parse(init.body))
     if (glmIntercept) return glmIntercept(init)
     const next = script.shift()
@@ -30,7 +32,12 @@ const mockFetch = async (url, init) => {
     if (typeof next === 'function') return next(init.signal)
     return next
   }
-  return realFetch(url, init) // 理论上不会走到这里
+  // 其余清言 URL(透传探测 / available_models)一律本地应答, 保证零联网
+  if (u.includes('operation/detail')) {
+    return new Response(JSON.stringify({ result: { models: [{ selected_model: 'glm-5.3', display_name: 'GLM-5.3', reasoning_efforts: [{ am_effort: 'low' }, { am_effort: 'high' }, { am_effort: 'max' }] }] } }), { headers: { 'content-type': 'application/json' } })
+  }
+  passthrough.push({ url: u, method: (init && init.method) || 'GET' })
+  return new Response('{"probe":true}', { status: 200, headers: { 'content-type': 'application/json' } })
 }
 globalThis.fetch = mockFetch
 const restoreFetch = () => { globalThis.fetch = realFetch }
@@ -450,6 +457,171 @@ convs.clear()
   check('正文保留', r.json.choices[0].message.content, '继续：')
   check('finish_reason=stop', r.json.choices[0].finish_reason, 'stop')
   check('会话映射已提交', convs.get('cv') != null, true)
+}
+
+// ---- 第四阶段 P0/P1 定点修复回归 ------------------------------------------------------
+// 注意: Chat Completions 判定按 AI SDK 实际请求路径(baseURL + /chat/completions)。
+const CHAT_URL = 'https://chatglm.cn/chat/completions'
+const postChat = (rawBody, init = {}) => loader.fetch(CHAT_URL, {
+  method: 'POST', headers: { 'content-type': 'application/json' }, body: rawBody, ...init,
+})
+
+console.log('\n[P0-1] 非法 arguments 字符串不得静默转成空参数调用')
+convs.clear()
+{
+  // 模型把 arguments 写成非法 JSON 字符串(外层协议 JSON 合法, arguments 字段值解析不了)
+  const badArgs = '{"tool_calls":[{"name":"bash","arguments":"{\\"command\\": \\"ls' + '"}]}'
+  script = [sseResp(frame({ conversation_id: 'cv', status: 'init', parts: [{ logic_id: 'p', status: 'init', content: [{ type: 'text', text: badArgs }] }] }) + okFinishFrame(badArgs))]
+  r = await callJson(withTools({ stream: false }))
+  check('HTTP 200(完成回合但调用被拒)', r.res.status, 200)
+  check('不出 tool_calls', r.json.choices[0].message.tool_calls, undefined)
+  check('不是空参数调用', JSON.stringify(r.json.choices[0].message.tool_calls || []).includes('"arguments":"{}"'), false)
+  check('finish_reason=stop', r.json.choices[0].finish_reason, 'stop')
+  check('原始内容保留在正文', /bash/.test(r.json.choices[0].message.content || ''), true)
+  // 流式路径同样拒绝
+  script = [sseResp(frame({ conversation_id: 'cv', status: 'init', parts: [{ logic_id: 'p', status: 'init', content: [{ type: 'text', text: badArgs }] }] }) + okFinishFrame(badArgs))]
+  const s = await callStream(withTools({ stream: true }), {})
+  check('流式不出 tool_calls chunk', s.chunks.some((c) => c.choices?.[0]?.delta?.tool_calls), false)
+  check('流式 finish_reason=stop', s.finish, 'stop')
+}
+convs.clear()
+{
+  // 合法 arguments 字符串(内层合法 JSON) → 仍要能解包放行(容错不回退)
+  const strArgs = '{"tool_calls":[{"name":"bash","arguments":"{\\"command\\":\\"ls\\"}"}]}'
+  script = [sseResp(frame({ conversation_id: 'cv', status: 'init', parts: [{ logic_id: 'p', status: 'init', content: [{ type: 'text', text: strArgs }] }] }) + okFinishFrame(strArgs))]
+  r = await callJson(withTools({ stream: false }))
+  check('合法字符串参数仍解包为调用', r.json.choices[0].finish_reason, 'tool_calls')
+  check('参数内容正确', r.json.choices[0].message.tool_calls[0].function.arguments, '{"command":"ls"}')
+  // 缺失 arguments + schema 有必填 → 拒绝(不得转成可执行空调用)
+  const missingArgs = '{"tool_calls":[{"name":"bash"}]}'
+  script = [sseResp(frame({ conversation_id: 'cv', status: 'init', parts: [{ logic_id: 'p', status: 'init', content: [{ type: 'text', text: missingArgs }] }] }) + okFinishFrame(missingArgs))]
+  r = await callJson(withTools({ stream: false }))
+  check('缺必填参数被拒(不出 tool_calls)', r.json.choices[0].finish_reason, 'stop')
+  check('无 tool_calls 字段', r.json.choices[0].message.tool_calls, undefined)
+  // 合法空对象 {} + schema 允许空对象(open_url 无 required? 有) → 用 open_url(必填 url) 拒绝、bash 必填也拒绝;
+  // 构造一个无必填 schema 的工具验证「合法 {} 通过」
+  const noReq = { model: 'glm-5.3-flash', messages: [{ role: 'user', content: 'x' }], stream: false, tools: [{ type: 'function', function: { name: 'ping', description: 'd', parameters: { type: 'object', properties: {} } } }] }
+  const pingJson = '{"tool_calls":[{"name":"ping","arguments":{}}]}'
+  script = [sseResp(frame({ conversation_id: 'cv', status: 'init', parts: [{ logic_id: 'p', status: 'init', content: [{ type: 'text', text: pingJson }] }] }) + okFinishFrame(pingJson))]
+  r = await callJson(noReq)
+  check('合法 {} 且 schema 允许 → 通过', r.json.choices[0].finish_reason, 'tool_calls')
+  check('arguments 为 {}', r.json.choices[0].message.tool_calls[0].function.arguments, '{}')
+  // 决定性用例(P0 本体): 无必填字段的工具 + 非法 arguments 字符串。
+  // 旧代码 looseJson()??{} 会把它变成合法的空参数调用 → Agent 真会执行 ping{};
+  // 新代码保留原文 → checkToolCall 按「不是合法 JSON」拒绝。
+  const pingBad = '{"tool_calls":[{"name":"ping","arguments":"{\\"x\\": \\"y' + '"}]}'
+  script = [sseResp(frame({ conversation_id: 'cv', status: 'init', parts: [{ logic_id: 'p', status: 'init', content: [{ type: 'text', text: pingBad }] }] }) + okFinishFrame(pingBad))]
+  r = await callJson(noReq)
+  check('无必填工具+非法参数 → 不出 tool_calls(旧代码会放行空参数调用)', r.json.choices[0].message.tool_calls, undefined)
+  check('按 stop 返回', r.json.choices[0].finish_reason, 'stop')
+  check('原始非法调用保留在正文', /ping/.test(r.json.choices[0].message.content || ''), true)
+  check('非法 arguments 原文未被吞掉', /arguments/.test(r.json.choices[0].message.content || ''), true)
+}
+
+console.log('\n[P1-1] Chat Completions POST 坏请求体 → 400 invalid_request_error')
+{
+  const before = glmCalls.length
+  r = await postChat('{"model":"glm-5.3-flash", 坏JSON')
+  check('坏 JSON → 400', r.status, 400)
+  const j1 = await r.json()
+  check('type=invalid_request_error', j1.error?.type, 'invalid_request_error')
+  check('是 JSON 不是透传', /application\/json/.test(r.headers.get('content-type') || ''), true)
+  r = await postChat(JSON.stringify({ model: 'glm-5.3-flash' }))
+  check('缺 messages → 400', r.status, 400)
+  const j2 = await r.json()
+  check('param=messages', j2.error?.param, 'messages')
+  r = await postChat(JSON.stringify({ model: 'glm-5.3-flash', messages: '不是数组' }))
+  check('messages 非数组 → 400', r.status, 400)
+  check('错误信息说明必须是数组', /数组/.test((await r.json()).error?.message || ''), true)
+  check('三类坏请求零上游调用', glmCalls.length, before)
+  // 合法空数组 messages → 通过校验进入聊天路径(非 400)
+  script = [sseResp(okFinishFrame('好的。'))]
+  r = await postChat(JSON.stringify({ model: 'glm-5.3-flash', messages: [] }))
+  check('messages=[] 合法 → 不进 400', r.status, 200)
+  await r.text()
+}
+{
+  // GET 探测透传保留: 非聊天 URL 的 GET → 透传分支(本地 mock 应答 {"probe":true})
+  passthrough.length = 0
+  const res = await loader.fetch('https://chatglm.cn/chatglm/agent-api/some-probe', { method: 'GET' })
+  const t = await res.text()
+  check('GET 探测仍走透传(未变 400)', res.status, 200)
+  check('透传命中本地 mock 应答', t.includes('probe'), true)
+  check('透传记录到一次非 stream 请求', passthrough.length, 1)
+  // POST 非聊天端点(无 messages) → 保持原透传行为(不按聊天 400)
+  passthrough.length = 0
+  const res2 = await loader.fetch('https://chatglm.cn/chatglm/backend-api/other', { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{"x":1}' })
+  check('POST 非聊天端点仍透传', res2.status, 200)
+  await res2.text()
+}
+
+console.log('\n[P1-2] 模型能力声明快照: temperature=false')
+{
+  const cfg = { provider: {} }
+  await plugin.config(cfg)
+  const provider = { models: cfg.provider.chatglm ? Object.fromEntries(Object.keys(cfg.provider.chatglm.models).map((id) => [id, { id, providerID: 'chatglm' }])) : {} }
+  const ms = await plugin.provider.models(provider, { auth: AUTH })
+  const anyModel = Object.values(ms)[0]
+  check('provider.models 有数据(mock available_models)', Object.keys(ms).length > 0, true)
+  check('capabilities.temperature === false', anyModel?.capabilities?.temperature, false)
+  check('capabilities.toolcall 仍为 true(提示词协议已声明)', anyModel?.capabilities?.toolcall, true)
+  check('capabilities.reasoning 仍为 true', anyModel?.capabilities?.reasoning, true)
+  const cfg2 = { provider: {} }
+  await plugin.config(cfg2)
+  check('config 声明不含 temperature 生效承诺(tool_call/reasoning 保留)', [cfg2.provider.chatglm.models['glm-5.3'].tool_call, cfg2.provider.chatglm.models['glm-5.3'].reasoning], [true, true])
+}
+
+console.log('\n[P1-3] tool_choice 语义钉死')
+{
+  const callJson2 = async (body) => {
+    const res = await postChat(JSON.stringify(body))
+    return { res, json: await res.json().catch(() => null) }
+  }
+  // none: 模型即使吐调用 JSON, 也不得输出 tool_calls
+  convs.clear()
+  script = [sseResp(frame({ conversation_id: 'cv', status: 'init', parts: [{ logic_id: 'p', status: 'init', content: [{ type: 'text', text: OK_JSON }] }] }) + okFinishFrame(OK_JSON))]
+  glmCalls.length = 0
+  r = await callJson2({ model: 'glm-5.3-flash', messages: [{ role: 'user', content: '看看目录' }], tools: withTools().tools, tool_choice: 'none', stream: false })
+  check('none: 不出 tool_calls', r.json.choices[0].finish_reason, 'stop')
+  check('none: 无 tool_calls 字段', r.json.choices[0].message.tool_calls, undefined)
+  check('none: 调用 JSON 以正文形式保留', /tool_calls/.test(r.json.choices[0].message.content || ''), true)
+  check('none: 注入文本不含工具协议', /工具调用协议/.test(glmCalls[0].messages[0].content[0].text), false)
+  // required: 模型给合法调用 → tool_calls
+  convs.clear()
+  script = [sseResp(frame({ conversation_id: 'cv', status: 'init', parts: [{ logic_id: 'p', status: 'init', content: [{ type: 'text', text: OK_JSON }] }] }) + okFinishFrame(OK_JSON))]
+  glmCalls.length = 0
+  r = await callJson2({ model: 'glm-5.3-flash', messages: [{ role: 'user', content: '看看目录' }], tools: withTools().tools, tool_choice: 'required', stream: false })
+  check('required+模型配合 → tool_calls', r.json.choices[0].finish_reason, 'tool_calls')
+  check('required: 注入强制文案', /本轮必须输出/.test(glmCalls[0].messages[0].content[0].text), true)
+  // required: 模型只给纯文本 → stop, 不伪造
+  convs.clear()
+  script = [sseResp(frame({ conversation_id: 'cv', status: 'init', parts: [{ logic_id: 'p', status: 'init', content: [{ type: 'text', text: '我直接回答你。' }] }] }) + okFinishFrame('我直接回答你。'))]
+  r = await callJson2({ model: 'glm-5.3-flash', messages: [{ role: 'user', content: '看看目录' }], tools: withTools().tools, tool_choice: 'required', stream: false })
+  check('required+模型不配合 → stop(不伪造调用)', [r.json.choices[0].finish_reason, r.json.choices[0].message.tool_calls], ['stop', undefined])
+  // 指定函数: 协议里只留该函数, 其他工具名调用被 schema 校验拒绝
+  convs.clear()
+  script = [sseResp(frame({ conversation_id: 'cv', status: 'init', parts: [{ logic_id: 'p', status: 'init', content: [{ type: 'text', text: OK_JSON }] }] }) + okFinishFrame(OK_JSON))]
+  glmCalls.length = 0
+  r = await callJson2({ model: 'glm-5.3-flash', messages: [{ role: 'user', content: '看看目录' }], tools: withTools().tools, tool_choice: { type: 'function', function: { name: 'open_url' } }, stream: false })
+  check('指定 open_url 后 bash 调用被拒(协议里已无 bash)', r.json.choices[0].finish_reason, 'stop')
+  check('协议段含 open_url 不含 bash 定义', /### open_url/.test(glmCalls[0].messages[0].content[0].text) && !/### bash/.test(glmCalls[0].messages[0].content[0].text), true)
+}
+
+console.log('\n[P1-4] 非流式思考内容边界钉死(当前行为: 不含思考字段)')
+convs.clear()
+{
+  const thinkJson = { model: 'glm-5.3-flash', messages: [{ role: 'user', content: '想一下' }], stream: false }
+  const thinkSse = frame({ conversation_id: 'cv', status: 'init', parts: [{ logic_id: 'p', status: 'init', content: [{ type: 'think', think: '内部推理过程' }] }] }) +
+    frame({ status: 'init', parts: [{ logic_id: 'p', status: 'init', content: [{ type: 'text', text: '结论是 42。' }] }] }) +
+    okFinishFrame('结论是 42。')
+  script = [sseResp(thinkSse)]
+  r = await callJson(thinkJson)
+  check('非流式正文只有回答', r.json.choices[0].message.content, '结论是 42。')
+  check('非流式 message 不含 reasoning 字段(边界声明)', Object.keys(r.json.choices[0].message).sort(), ['content', 'role'])
+  check('usage 的 reasoning_tokens 仍计入思考', r.json.usage.completion_tokens_details.reasoning_tokens > 0, true)
+  script = [sseResp(thinkSse)]
+  const s = await callStream({ ...thinkJson, stream: true }, {})
+  check('流式则透传 reasoning_content', s.raw.includes('内部推理过程'), true)
 }
 
 restoreFetch()
