@@ -788,16 +788,22 @@ function looseJson(text) {
 
 let callSeq = 0
 // 单个调用 → OpenAI tool_call; 兼容 {name,arguments} / {function:{...}} / {name,parameters}
+// 参数三态严格区分(P0-1): 缺失 arguments → "{}"(交由 schema 校验必填项);
+// 合法 JSON(含规范的空对象) → 正常序列化; 非法 JSON 字符串 → 保留原文, 不静默转 {} ——
+// checkToolCall 会按「arguments 不是合法 JSON」拒绝整条调用, 防止空参数调用被 Agent 执行。
 function toToolCall(c, i = 0) {
   const fn = c?.function || c || {}
   const name = fn.name || fn.tool_name || c?.tool_name || ""
   if (typeof name !== "string" || !name) return null
   let args = fn.arguments ?? fn.parameters ?? fn.args ?? c?.arguments ?? c?.parameters ?? {}
-  if (typeof args === "string") args = looseJson(args) ?? {} // 字符串里还包着一层就再解一层
+  if (typeof args === "string") {
+    const parsed = looseJson(args) // 字符串里还包着一层就再解一层(合法但不规范的 JSON 仍受支持)
+    args = parsed === null ? args : parsed // 解不动 = 非法: 原样保留, 让校验拒绝
+  }
   return {
     id: typeof c?.id === "string" && c.id ? c.id : `call_${uuid32().slice(0, 10)}_${callSeq++}_${i}`,
     type: "function",
-    function: { name, arguments: JSON.stringify(args ?? {}) },
+    function: { name, arguments: typeof args === "string" ? args : JSON.stringify(args ?? {}) },
   }
 }
 
@@ -1371,12 +1377,27 @@ export async function ChatglmAuthPlugin({ client }) {
               ? { method: input.method, headers: input.headers, body: input.body, signal: input.signal, duplex: "half", ...init }
               : { ...init }
             const rawBody = opts.body == null ? "{}" : typeof opts.body === "string" ? opts.body : await new Response(opts.body).text()
-            let openai = {}
-            try { openai = JSON.parse(rawBody) } catch {}
-            if (!openai.messages) {
+            const reqUrl = input instanceof Request ? input.url : String(input)
+            const reqMethod = String(opts.method || (input instanceof Request && input.method) || "POST").toUpperCase()
+            let openai = null
+            let bodyParseError = null
+            try { openai = JSON.parse(rawBody) } catch (e) { bodyParseError = e }
+            // Chat Completions 的 POST 请求严格校验(P1-1): 坏 JSON / 缺 messages / 非数组 → 400。
+            // 按路径+方法识别, 其他请求(GET 探测、非聊天端点)保持原有签名透传不变。
+            const isChatPost = reqMethod === "POST" && /\/chat\/completions\/?$/.test(reqUrl.split("?")[0])
+            const invalidRequest = (message, param) => new Response(
+              JSON.stringify({ error: { message, type: "invalid_request_error", param: param ?? null, code: null } }),
+              { status: 400, headers: { "content-type": "application/json", "x-magpie-sign-in": "kept" } },
+            )
+            if (isChatPost) {
+              if (bodyParseError || openai === null || typeof openai !== "object" || Array.isArray(openai))
+                return invalidRequest("请求体不是合法的 JSON 对象", null)
+              if (!Array.isArray(openai.messages))
+                return invalidRequest(openai.messages === undefined ? "缺少必填参数 messages" : "messages 必须是数组", "messages")
+            }
+            if (!openai || !openai.messages) {
               // 网关偶发的非对话请求(探测/列表): 带签名透传
-              const url = input instanceof Request ? input.url : String(input)
-              const r = await fetch(url.startsWith("http") ? url : HOST + url, {
+              const r = await fetch(reqUrl.startsWith("http") ? reqUrl : HOST + reqUrl, {
                 method: opts.method || "GET",
                 headers: signedHeaders({ device: c.device, token: c.token }),
                 signal: opts.signal,
@@ -1752,7 +1773,7 @@ export async function ChatglmAuthPlugin({ client }) {
                 variants,
                 capabilities: {
                   ...(was.capabilities ?? {}),
-                  temperature: true,
+                  temperature: false, // 网页协议不暴露采样参数, 请求里的 temperature 被忽略 —— 不虚报
                   reasoning: true,
                   attachment: false, // 附件/图像上传还没接, 见 README
                   toolcall: true, // 提示词协议模拟出来的, 见"工具调用"段
