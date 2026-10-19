@@ -162,12 +162,30 @@ magpie/ZCode 看到的就是标准 Chat Completions 语义, 逐项对照:
 2. 对照上表核对端点/头/请求体/SSE。
 3. 签名函数在页面 `main.*.js` 里(搜 `x-nonce`),等价实现已在 `_internal.luhnStamp`。
 4. 改版导致盐值变更: 设 `CHATGLM_SIGN_SALT=<新盐>` 即可续命, 不必等插件发版。
-5. 设 `CHATGLM_DEBUG=1` 把请求摘要与上游原始 SSE 帧样本打进 magpie 日志, 便于对照抓包定位协议漂移。
+5. 设 `CHATGLM_DEBUG=1` 把请求入参摘要与上游原始 SSE 帧样本打进 magpie 日志(帧样本含模型输出正文, 仅排障时开), 便于对照抓包定位协议漂移。
+
+### 每请求摘要日志(无需 DEBUG, info 级)
+
+每次对话请求结束固定输出一行 `chat done ...`, 字段全为计数/时长/id/枚举——**不含正文、提示词、token、工具参数**:
+
+```
+chat done id=<8位关联键> status=<HTTP码> conv=<复用id|new> reason=<结束原因> rebuild=<复用/重建原因>
+  ms=<总耗时> ttfb=<首帧耗时|-1> retries=<建流重试次数> upstream=<上游HTTP状态> in=<上下文字符> out=<正文字符> think=<思考字符> calls=<工具调用数>
+```
+
+| 字段 | 取值 | 用途 |
+|---|---|---|
+| `reason` | `stop` / `tool_calls` / `length` / `upstream_error` / `interrupted` / `incomplete` / `cancelled` | 六类结束原因一眼区分(含空闲超时→`interrupted`, 其 warn 行含「无响应」) |
+| `rebuild` | `reuse` / `new` / `quarantined` / `retired` / `busy` / `acct-changed` / `ctx-changed` / `session-mismatch` / `history-diverged` / `stale-or-oversized` / `branched` | 为什么复用/重建——观察期看 `rebuild≠reuse` 占比与 `in=` 趋势判断隔离是否过激 |
+| `id` | 8 hex | 与同请求的 warn/error 行(`[id] stream read failed` 等)串联复现 |
+| `ttfb` | ms, `-1`=没等到首帧 | 慢请求定位(上游慢 vs 传输慢) |
+
+配套可调参数: `CHATGLM_IDLE_TIMEOUT_MS`(默认 180000, 上游读空闲判死; 0=禁用)。故障分类 ↔ 测试用例映射见 `docs/ops-audit.md` §0/§3。
 
 ## 测试
 
 ```bash
-npm test              # 纯逻辑, 不联网: 工具调用解析/流式组装/会话复用 + 终态回归(mock fetch/SSE) + 登录流程判定
+npm test              # 纯逻辑, 不联网: 工具解析/终态/会话隔离/诊断路径(392 项 mock) + 登录流程判定
 npm run test:live     # 联网冒烟(用本机 magpie 已登录的账号, 会消耗少量积分)
 ```
 

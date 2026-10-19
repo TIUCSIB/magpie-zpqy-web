@@ -75,7 +75,7 @@ function luhnStamp(ms) {
   return A.substring(0, A.length - 2) + (sum % 10) + A.substring(A.length - 1)
 }
 
-function signedHeaders({ device, token = "", json = false, sse = false }) {
+function signedHeaders({ device, token = "", json = false, sse = false, requestId = "" }) {
   const ts = luhnStamp(Date.now())
   const nonce = uuid32()
   return {
@@ -85,7 +85,7 @@ function signedHeaders({ device, token = "", json = false, sse = false }) {
     "x-app-fr": "default",
     "x-lang": "zh",
     "x-device-id": device,
-    "x-request-id": uuid32(),
+    "x-request-id": requestId || uuid32(),
     "x-timestamp": ts,
     "x-nonce": nonce,
     "x-sign": md5hex(`${ts}-${nonce}-${SIGN_SALT}`),
@@ -335,8 +335,10 @@ function browserFlow(log, opts = {}) {
       } catch {}
     }
     state.child = null
+    process.off("exit", onExit) // G7: 登录结束即摘除, 不随登录次数累加全局监听器
   }
-  process.on("exit", () => cleanup()) // 宿主进程被 kill 时回收调试浏览器, 不留孤儿 Chrome
+  const onExit = () => cleanup() // 宿主进程被 kill 时回收调试浏览器, 不留孤儿 Chrome
+  process.on("exit", onExit)
 
   const start = async () => {
     if (!state.exe) throw new Error("找不到 Chrome/Edge —— 请改用「粘贴 Cookie」方式登录")
@@ -576,6 +578,13 @@ function busySub(conv) { const r = normRec(conv); if (r && r.busy > 0) r.busy-- 
 
 // 清理顺序固定(§9.3): dirty TTL → 隔离/退役整条删除 → active 按 lastUsed LRU。
 // 只产生删除, 不产生状态降级 —— 已隔离会话不存在「洗白回正常映射」的路径。
+let lastSweepAt = 0
+function sweepThrottled() { // 读取路径也触发清理(节流 60s): 低流量时段 24h 过期语义照样兑现
+  const now = Date.now()
+  if (now - lastSweepAt < 60_000) return
+  lastSweepAt = now
+  sweep()
+}
 function sweep() {
   const now = Date.now()
   for (const [k, t] of dirty) if (now - t > DIRTY_TTL_MS) dirty.delete(k)
@@ -994,6 +1003,7 @@ function withinLimits(gap, freshBytes, rec, hasSession) {
 // 兜底: 对不上(新会话 / 上下文变 / 历史被压缩)→ 新会话, system+工具协议+历史 内联合并。
 // ctx 默认 {} → acct/ctxKey/sessionKey 皆空, 与旧 remember(conv,sig) 两参调用兼容。
 function translateRequest(openai, tools, ctx = {}) {
+  sweepThrottled()
   const msgs = Array.isArray(openai.messages) ? openai.messages : []
   const sysText = msgs.filter((m) => m.role === "system" || m.role === "developer").map((m) => textOf(m.content)).filter(Boolean).join("\n\n")
   const sysParts = msgs.filter((m) => m.role === "system" || m.role === "developer").map((m) => ({ role: m.role === "developer" ? "developer" : "system", text: textOf(m.content) })).filter((m) => m.text)
@@ -1013,20 +1023,33 @@ function translateRequest(openai, tools, ctx = {}) {
   const reqSession = ctx.sessionKey ?? ""
 
   // 六条件过滤(§4.1): acct / ctxKey / 未隔离未退役 / 无在途 / sessionKey 一致(有头才查) / 前缀成立
+  // why: 首个被拒原因(供摘要日志区分「为什么没复用」—— 验收标准: 上下文变化重建可辨识)
   const cands = []
+  let why = "new"
   for (const [conv, v] of convs) {
     const rec = readRec(v)
     if (!rec.sig.length) continue
-    if (rec.quarantined || rec.retired) continue
-    if (rec.busy > 0) continue
-    if (rec.acct !== reqAcct || rec.ctxKey !== reqCtxKey) continue
-    if (reqSession && rec.sessionKey !== reqSession) continue
-    if (!isPrefix(rec.sig, sig)) continue
+    let r = ""
+    if (rec.quarantined) r = "quarantined"
+    else if (rec.retired) r = "retired"
+    else if (rec.busy > 0) r = "busy"
+    else if (rec.acct !== reqAcct) r = "acct-changed"
+    else if (rec.ctxKey !== reqCtxKey) r = "ctx-changed"
+    else if (reqSession && rec.sessionKey !== reqSession) r = "session-mismatch"
+    else if (!isPrefix(rec.sig, sig)) r = "history-diverged"
+    if (r) {
+      if (why === "new") why = r
+      // 前缀不成立是唯一「本请求与它同身份但历史分叉」的拒绝原因 → 退役(决策 2);
+      // quarantine/retired/busy/身份不符的不动(棘轮/临时态/本来就属于别人)
+      if (r === "history-diverged") retire(conv, "history-diverged")
+      continue
+    }
     cands.push([conv, rec])
   }
   // 决策 3: 多候选不比较, 直接重建; 旧分支退役
   if (cands.length > 1) {
     for (const [conv] of cands) retire(conv, "branched")
+    why = "branched"
   } else if (cands.length === 1) {
     const [conv, rec] = cands[0]
     const gap = sig.length - rec.sig.length
@@ -1037,20 +1060,13 @@ function translateRequest(openai, tools, ctx = {}) {
       const errored = fresh.some((t) => t.role === "tool" && TOOL_ERR_RE.test(t.text))
       let text = fresh.map((t, i) => (t.role === "tool" && i === fresh.length - 1 ? `${t.text}\n\n${TOOL_REMINDER}` : t.text)).join("\n\n")
       if (errored) text += `\n\n${TOOL_ERR_REMINDER}`
-      return { conv, text, sig, fullText, blocked, ctxKey: reqCtxKey, acct: reqAcct, sessionKey: reqSession }
+      return { conv, text, sig, fullText, blocked, ctxKey: reqCtxKey, acct: reqAcct, sessionKey: reqSession, rebuildReason: "reuse" }
     }
     // 唯一候选但增量超限(消息数/体积/耗时) → 退役重建
     retire(conv, "stale-or-oversized")
-  }
-  // 前缀不成立但存在 acct/ctx/session 一致、未隔离的旧 conv(历史被压缩/裁剪/分叉) → 退役(决策 2)
-  if (cands.length === 0) {
-    for (const [conv, v] of convs) {
-      const rec = readRec(v)
-      if (rec.quarantined || rec.retired || rec.busy > 0) continue
-      if (rec.acct !== reqAcct || rec.ctxKey !== reqCtxKey) continue
-      if (reqSession && rec.sessionKey !== reqSession) continue
-      if (rec.sig.length && !isPrefix(rec.sig, sig)) retire(conv, "history-diverged")
-    }
+    why = "stale-or-oversized"
+  } else if (convs.size === 0) {
+    why = "new"
   }
 
   const hist = turns
@@ -1065,7 +1081,7 @@ function translateRequest(openai, tools, ctx = {}) {
   parts.push(`# 本轮用户消息\n${last || "(空)"}`)
   // 重开会话时历史全量内联, 只看最近几条工具结果, 太久的报错不再提醒
   if (turns.slice(-6).some((t) => t.role === "tool" && TOOL_ERR_RE.test(t.text))) parts.push(TOOL_ERR_REMINDER)
-  return { conv: "", text: parts.join("\n\n"), sig, fullText, blocked, ctxKey: reqCtxKey, acct: reqAcct, sessionKey: reqSession }
+  return { conv: "", text: parts.join("\n\n"), sig, fullText, blocked, ctxKey: reqCtxKey, acct: reqAcct, sessionKey: reqSession, rebuildReason: why }
 }
 
 // 清言 SSE 事件 → OpenAI chat.completion.chunk。
@@ -1096,9 +1112,11 @@ class ChatglmSSE {
     this._started = false
     // ---- 终态 ----
     this.round = null // ROUND.*, end() 时一次性判定(权威); 判定后不再改
+    this.finishReason = null // stop/tool_calls/length —— 摘要日志的 reason 字段
     this.upstreamFinish = false // 收到过事件级 status:finish(上游正常完成的唯一信号)
     this.outError = null // end() 判定为失败终态时, 由调用方翻成 HTTP 错误体或流内错误帧
     this.parseErrors = 0 // 单帧 JSON.parse 失败计数(与传输错误分开统计)
+    this.idleTimeout = false // pump 读空闲超时标记(区分 AbortError 来源: 超时 vs 用户取消)
   }
 
   // 同一会话内再发一轮前调用: 解析只看这一轮的输出, 已发出的正文不回滚
@@ -1112,6 +1130,7 @@ class ChatglmSSE {
     this.intervene = ""
     this.round = null
     this.outError = null
+    this.idleTimeout = false
   }
 
   // 外部(pump/handler)记终态: 只在尚未定局时生效, 已定局的失败不被后来的 EOF「洗白」
@@ -1125,6 +1144,7 @@ class ChatglmSSE {
   }
 
   emit(delta, finish) {
+    if (finish) this.finishReason = finish
     if (!this._started) { this._started = true; delta = { role: "assistant", ...delta } }
     this.onChunk({
       id: this.id,
@@ -1273,7 +1293,8 @@ function accumulate(st, field, incoming, full) {
 // ---- 插件 ---------------------------------------------------------------------------
 
 export async function ChatglmAuthPlugin({ client }) {
-  const log = (m) => { try { client?.app?.log?.({ body: { service: "chatglm-auth", level: "error", message: m } }) } catch {} }
+  // 级别参数: 正常摘要用 info, 故障路径保持 error(宿主面板按级别过滤)
+  const log = (m, level = "error") => { try { client?.app?.log?.({ body: { service: "chatglm-auth", level, message: m } }) } catch {} }
   const DEBUG = !!process.env.CHATGLM_DEBUG // 排障: 打请求摘要与上游 SSE 帧样本(协议漂移时对照抓包用)
 
   return {
@@ -1450,6 +1471,10 @@ export async function ChatglmAuthPlugin({ client }) {
             // sse 要先于取消桥接创建(同步 abort 路径会立刻调 onCancel)。
             const sse = new ChatglmSSE(model, { tools, blockedCalls: req.blocked })
             sse.holdEnd = true // finish 帧只标记回合结束; 空转/重发时还要补一轮
+            // 请求遥测(第五阶段 G2): 关联键 + 计时; 全部字段为计数/时长/枚举, 无正文无凭据
+            const reqId = uuid32().slice(0, 8)
+            const t0 = Date.now()
+            const tm = { firstFrameAt: 0, attempts: 0, upstreamStatus: 0 }
             const ctrl = new AbortController()
             let cancelled = false
             const onCancel = () => {
@@ -1458,9 +1483,13 @@ export async function ChatglmAuthPlugin({ client }) {
               sse.markRound(ROUND.CANCELLED)
               try { ctrl.abort() } catch {}
             }
+            let detachSignal = () => {}
             if (opts.signal) {
               if (opts.signal.aborted) onCancel()
-              else opts.signal.addEventListener("abort", onCancel, { once: true })
+              else {
+                opts.signal.addEventListener("abort", onCancel, { once: true })
+                detachSignal = () => { try { opts.signal.removeEventListener("abort", onCancel) } catch {} } // G4: 收尾摘除, 不拖住请求闭包
+              }
             }
 
             // 交付状态机(设计文档 §3): chosenConv 是请求开始就固定的隔离目标快照, 不依赖响应是否回 id。
@@ -1484,7 +1513,25 @@ export async function ChatglmAuthPlugin({ client }) {
             // 语义是「拒绝复用」而非排队 —— 其他请求见 busy>0 走重建, 永不互相阻塞。
             if (chosenConv) busyAdd(chosenConv)
             let busyReleased = false
-            const releaseBusy = () => { if (!busyReleased) { busyReleased = true; if (chosenConv) busySub(chosenConv) } }
+            const releaseBusy = () => {
+              if (busyReleased) return
+              busyReleased = true
+              if (chosenConv) busySub(chosenConv)
+              detachSignal() // G4: 请求生命周期到此为止
+            }
+            // 每请求摘要(第五阶段 G2): 一条 info 级结构化行, 区分六类终态与重建原因。
+            // 字段全为 计数/时长/id/枚举 —— 零正文、零凭据(验收红线)。
+            let summaryDone = false
+            const summary = (status) => {
+              if (summaryDone) return
+              summaryDone = true
+              const reason = sse.round === ROUND.COMPLETED || sse.round === ROUND.TRUNCATED
+                ? (sse.finishReason || (sse.round === ROUND.TRUNCATED ? "length" : "stop"))
+                : sse.round || "unknown"
+              const rebuild = req.rebuildReason || "new"
+              const ttfb = tm.firstFrameAt ? tm.firstFrameAt - t0 : -1
+              log(`chat done id=${reqId} status=${status} conv=${chosenConv || "new"} reason=${reason} rebuild=${rebuild} ms=${Date.now() - t0} ttfb=${ttfb} retries=${Math.max(0, tm.attempts - 1)} upstream=${tm.upstreamStatus || "-"} in=${(req.fullText || req.text).length} out=${sse.text.length} think=${sse.think.length} calls=${sse.calls?.length ?? 0}`, "info")
+            }
 
             // 一轮 = 一次上游流; 空转续写会再发一轮, 复用同一 conversation_id
             const startRound = async (text, convId) => {
@@ -1494,12 +1541,14 @@ export async function ChatglmAuthPlugin({ client }) {
                 if (cancelled) { const e = new Error("请求已取消"); e.cancelled = true; throw e }
                 try {
                   fetchIssued = true // 一旦置位, 本请求至少提交过一次 → 之后取消不再算 not_sent
+                  tm.attempts++
                   res = await fetch(`${HOST}/chatglm/backend-api/assistant/stream`, {
                     method: "POST",
-                    headers: signedHeaders({ device: c.device, token: c.token, json: true, sse: true }),
+                    headers: signedHeaders({ device: c.device, token: c.token, json: true, sse: true, requestId: reqId + uuid32().slice(8) }), // 前 8 位=日志关联键, 整体仍 32hex
                     body: glmBody(text, convId),
                     signal: ctrl.signal,
                   })
+                  if (res?.status) tm.upstreamStatus = res.status
                 } catch (e) {
                   err = e
                   res = null
@@ -1522,7 +1571,7 @@ export async function ChatglmAuthPlugin({ client }) {
                 if (attempt === 0 && !cancelled) await sleep(1200)
               }
               if (!res) {
-                log(`stream fetch failed: ${err?.message ?? err}`)
+                log(`[${reqId}] stream fetch failed: ${err?.message ?? err}`)
                 throw err
               }
               if (res.ok) return res
@@ -1547,9 +1596,10 @@ export async function ChatglmAuthPlugin({ client }) {
               // 客户端无法区分「被取消」与「服务端炸了」
               // 交付分类: 取消且从未发出 fetch → not_sent(旧 conv 不动); 其余(网络抛错/HTTP 错误/
               // 发出后才取消) → delivery_unknown(rejected 未实测, 保持空集)
-              if (e?.cancelled) { settle(!fetchIssued ? "not_sent" : "delivery_unknown"); releaseBusy(); return errorResponse({ status: 499, message: "请求已取消", code: "cancelled" }) }
+              if (e?.cancelled) { settle(!fetchIssued ? "not_sent" : "delivery_unknown"); releaseBusy(); summary(499); return errorResponse({ status: 499, message: "请求已取消", code: "cancelled" }) }
               settle("delivery_unknown")
               releaseBusy()
+              summary(e?.status || 502)
               if (e?.status || e?.message) return errorResponse(e)
               throw e
             }
@@ -1578,23 +1628,37 @@ export async function ChatglmAuthPlugin({ client }) {
 
             // 一轮的 SSE 流进 sse; 回合结束(roundDone)就停, 不等连接关闭。
             // 读流异常记 interrupted、正常 EOF 但没完成事件记 incomplete —— 不再静默收尾。
+            // G3: 读空闲超时 —— 半开连接(无帧无断)不再让 pump 无界等待; 0 = 禁用。
+            const IDLE_MS = () => { const v = Number(process.env.CHATGLM_IDLE_TIMEOUT_MS || 0); return v > 0 ? v : 180_000 }
             const pump = async (res) => {
               const reader = res.body.getReader()
               const dec = new TextDecoder()
               let buf = ""
               while (true) {
                 let value, done
+                let timer = null
                 try {
-                  ;({ value, done } = await reader.read())
+                  const read = reader.read()
+                  timer = setTimeout(() => {
+                    log(`[${reqId}] upstream read idle ${IDLE_MS()}ms, aborting stream`, "warn")
+                    sse.idleTimeout = true
+                    sse.markRound(ROUND.INTERRUPTED, `上游 ${IDLE_MS()}ms 无响应, 连接判死`) // 先定局: 之后 read 以 reject/EOF 结束都不改终态(markRound 先到先得)
+                    try { ctrl.abort() } catch {} // 掐上游; read() 将以 reject/EOF 结束
+                  }, IDLE_MS())
+                  ;({ value, done } = await read)
                 } catch (e) {
-                  if (cancelled || e?.name === "AbortError") { sse.markRound(ROUND.CANCELLED) }
+                  if (sse.idleTimeout) { /* 终态已由 timer 定为 interrupted, 这里只释放 */ }
+                  else if (cancelled || e?.name === "AbortError") { sse.markRound(ROUND.CANCELLED) }
                   else {
-                    log(`stream read failed: ${e?.message ?? e}`)
+                    log(`[${reqId}] stream read failed: ${e?.message ?? e}`)
                     sse.markRound(ROUND.INTERRUPTED, `读取上游流失败: ${e?.message ?? e}`)
                   }
                   try { reader.cancel().catch(() => {}) } catch {} // 尽力释放, 不 await(已损坏的 reader cancel 可能挂起/拒绝)
                   return
+                } finally {
+                  if (timer) clearTimeout(timer)
                 }
+                if (!tm.firstFrameAt && value) tm.firstFrameAt = Date.now() // G2: 首帧耗时
                 if (done) break
                 buf += dec.decode(value, { stream: true })
                 let i
@@ -1606,7 +1670,7 @@ export async function ChatglmAuthPlugin({ client }) {
                     let evt = null
                     try { evt = JSON.parse(line.slice(5).trim()) } catch (e) {
                       // 单帧解析失败 ≠ 网络失败: 计数并留样本, 继续读后面的帧
-                      if (sse.parseErrors++ < 3) log(`sse frame parse failed x${sse.parseErrors}: ${line.slice(5, 160)}`)
+                      if (sse.parseErrors++ < 3) log(`[${reqId}] sse frame parse failed x${sse.parseErrors}: ${line.slice(5, 160)}`)
                       continue
                     }
                     sse.feed(evt)
@@ -1661,7 +1725,7 @@ export async function ChatglmAuthPlugin({ client }) {
               try {
                 res = await startRound(nudge, sse.conv || req.conv)
               } catch (e) {
-                log(`nudge round failed: ${e?.message ?? e}`)
+                log(`[${reqId}] nudge round failed: ${e?.message ?? e}`)
                 // 续写轮没发出去: 保留首轮结果由 end() 定终态
                 // (首轮已收到 finish 帧就是完成回合, 不能被续写失败倒扣成 interrupted)
                 return
@@ -1674,27 +1738,40 @@ export async function ChatglmAuthPlugin({ client }) {
             const isStream = openai.stream === true || openai.stream === 'true'
             if (!isStream) {
               // 非流式: 聚合后回一个 chat.completion
-              await pump(first)
-              if (stalledRound()) await retryRound()
-              else if (repeatStalled()) await retryRound(TOOL_NUDGE_REPEAT)
-              if (!sse.finished) sse.end()
-              // 交付状态机: completed 提交前缀; 截断/错误/中断/不完整/流中取消 → 隔离快照; 未发出取消 → 不动
-              settle(deliveryClass())
-              releaseBusy() // 非流式: 到这里上游流生命周期已结束
-              // 失败终态不能伪装成成功的 chat.completion: 返回 OpenAI 风格错误体
-              if (sse.outError) {
-                const status = sse.round === ROUND.CANCELLED ? 499 : 502
-                return errorResponse({ status, message: sse.outError.message, code: sse.outError.code, signIn: "kept" })
+              // G1: 收尾(settle/releaseBusy/summary)放 finally 必达 —— 意外异常不再泄漏 busy
+              let httpStatus = 0
+              try {
+                await pump(first)
+                if (stalledRound()) await retryRound()
+                else if (repeatStalled()) await retryRound(TOOL_NUDGE_REPEAT)
+                if (!sse.finished) sse.end()
+                // 交付状态机: completed 提交前缀; 截断/错误/中断/不完整/流中取消 → 隔离快照; 未发出取消 → 不动
+                settle(deliveryClass())
+                // 失败终态不能伪装成成功的 chat.completion: 返回 OpenAI 风格错误体
+                if (sse.outError) {
+                  httpStatus = sse.round === ROUND.CANCELLED ? 499 : 502
+                  return errorResponse({ status: httpStatus, message: sse.outError.message, code: sse.outError.code, signIn: "kept" })
+                }
+                const msg = sse.calls
+                  ? { role: "assistant", content: sse.text || null, tool_calls: sse.calls }
+                  : { role: "assistant", content: sse.text || `[chatglm] 空回复${sse.error ? `: ${sse.error}` : ""}` }
+                httpStatus = 200
+                return new Response(JSON.stringify({
+                  id: sse.id, object: "chat.completion", created: Math.floor(Date.now() / 1000), model,
+                  choices: [{ index: 0, message: msg, finish_reason: sse.calls ? "tool_calls" : sse.truncated ? "length" : "stop" }],
+                  usage: usageEstimate(),
+                }), { status: 200, headers: { "content-type": "application/json", "x-magpie-sign-in": "kept" } })
+              } catch (e) {
+                // 插件内部异常: 保守分类(已发出过 fetch → 交付不确定, 隔离快照), 降级为 500 错误体而非抛出
+                log(`[${reqId}] internal error: ${e?.stack ?? e?.message ?? e}`)
+                if (!sse.finished) { sse.markRound(ROUND.INTERRUPTED, `插件内部异常: ${e?.message ?? e}`); try { sse.end() } catch {} }
+                settle(deliveryClass())
+                httpStatus = 500
+                return errorResponse({ status: 500, message: `chatglm 插件内部异常: ${e?.message ?? e}`, code: "internal_error" })
+              } finally {
+                releaseBusy()
+                summary(httpStatus)
               }
-              if (DEBUG) log(`chat -> conv=${sse.conv || "?"} round=${sse.round} text=${sse.text.length}ch think=${sse.think.length}ch calls=${sse.calls?.length ?? 0}`)
-              const msg = sse.calls
-                ? { role: "assistant", content: sse.text || null, tool_calls: sse.calls }
-                : { role: "assistant", content: sse.text || `[chatglm] 空回复${sse.error ? `: ${sse.error}` : ""}` }
-              return new Response(JSON.stringify({
-                id: sse.id, object: "chat.completion", created: Math.floor(Date.now() / 1000), model,
-                choices: [{ index: 0, message: msg, finish_reason: sse.calls ? "tool_calls" : sse.truncated ? "length" : "stop" }],
-                usage: usageEstimate(),
-              }), { status: 200, headers: { "content-type": "application/json", "x-magpie-sign-in": "kept" } })
             }
 
             // 流式: 清言 SSE → OpenAI chunk
@@ -1708,28 +1785,40 @@ export async function ChatglmAuthPlugin({ client }) {
                 // 心跳: deep_thinking 首字可 70s+, 中间层普遍 60-120s 空闲就掐; SSE 注释帧按规范被客户端忽略
                 ping = setInterval(() => { try { sink.enqueue(enc.encode(": ping\n\n")) } catch { clearInterval(ping) } }, 15000)
                 try {
-                  await pump(first)
-                  if (stalledRound()) await retryRound()
-                  else if (repeatStalled()) await retryRound(TOOL_NUDGE_REPEAT)
-                } finally { clearInterval(ping); ping = null }
-                if (!sse.finished) sse.end()
-                settle(deliveryClass())
-                releaseBusy() // 流式: pump+retry+end 全部结束, 上游流生命周期到此为止
-                if (DEBUG) log(`chat -> conv=${sse.conv || "?"} round=${sse.round} text=${sse.text.length}ch think=${sse.think.length}ch calls=${sse.calls?.length ?? 0}${sse.error ? ` err=${sse.error}` : ""}`)
-                try {
-                  // 失败终态: 流内错误帧 + 关闭, 不发 [DONE] —— OpenAI 官方流式错误同此形态(HTTP 200 后 data 里带 error)。
-                  // 已知限制: 个别只做「[DONE]=成功」字面判断的客户端可能仍把这次断开当结束; 但无 finish_reason + error 帧 + 无 [DONE],
-                  // 已是纯 SSE 通道下能选的最可区分的方案(见 README「流内错误」)。
-                  if (sse.outError) {
-                    sink.enqueue(sseData({ error: { message: sse.outError.message, type: "server_error", param: null, code: sse.outError.code } }))
+                  try {
+                    await pump(first)
+                    if (stalledRound()) await retryRound()
+                    else if (repeatStalled()) await retryRound(TOOL_NUDGE_REPEAT)
+                  } finally { clearInterval(ping); ping = null }
+                  if (!sse.finished) sse.end()
+                  settle(deliveryClass())
+                  try {
+                    // 失败终态: 流内错误帧 + 关闭, 不发 [DONE] —— OpenAI 官方流式错误同此形态(HTTP 200 后 data 里带 error)。
+                    // 已知限制: 个别只做「[DONE]=成功」字面判断的客户端可能仍把这次断开当结束; 但无 finish_reason + error 帧 + 无 [DONE],
+                    // 已是纯 SSE 通道下能选的最可区分的方案(见 README「流内错误」)。
+                    if (sse.outError) {
+                      sink.enqueue(sseData({ error: { message: sse.outError.message, type: "server_error", param: null, code: sse.outError.code } }))
+                      sink.close()
+                      return
+                    }
+                    // 标准 OpenAI 流式 usage 尾块(choices 空), 仅客户端显式 stream_options.include_usage 时输出
+                    if (wantUsage) sink.enqueue(sseData({ id: sse.id, object: "chat.completion.chunk", created: Math.floor(Date.now() / 1000), model: sse.model, choices: [], usage: usageEstimate() }))
+                    sink.enqueue(enc.encode("data: [DONE]\n\n"))
                     sink.close()
-                    return
-                  }
-                  // 标准 OpenAI 流式 usage 尾块(choices 空), 仅客户端显式 stream_options.include_usage 时输出
-                  if (wantUsage) sink.enqueue(sseData({ id: sse.id, object: "chat.completion.chunk", created: Math.floor(Date.now() / 1000), model: sse.model, choices: [], usage: usageEstimate() }))
-                  sink.enqueue(enc.encode("data: [DONE]\n\n"))
-                  sink.close()
-                } catch {} // 下游已断开: cancel() 已记终态, 这里静默收尾
+                  } catch {} // 下游已断开: cancel() 已记终态, 这里静默收尾
+                } catch (e) {
+                  // G1: 意外内部异常 —— 不裸抛成 broken stream; 保守分类 + 尽力发流内错误帧
+                  log(`[${reqId}] internal error(stream): ${e?.stack ?? e?.message ?? e}`)
+                  if (!sse.finished) { sse.markRound(ROUND.INTERRUPTED, `插件内部异常: ${e?.message ?? e}`); try { sse.end() } catch {} }
+                  settle(deliveryClass())
+                  try {
+                    sink.enqueue(sseData({ error: { message: `chatglm 插件内部异常: ${e?.message ?? e}`, type: "server_error", param: null, code: "internal_error" } }))
+                    sink.close()
+                  } catch {}
+                } finally {
+                  releaseBusy() // 流式: 上游流生命周期到此为止(正常/异常/取消都经这里)
+                  summary(200) // 流式 HTTP 状态固定 200, 结果由 reason 字段表达
+                }
               },
               // 下游取消/断开: 记 cancelled、掐上游 fetch 与心跳, 不再重试与续写
               cancel() {
@@ -1802,6 +1891,7 @@ export const _internal = {
   callKey, failedCallKeys, TOOL_ERR_RE, TOOL_ERR_REMINDER, TOOL_NUDGE_REPEAT,
   ROUND, ROUND_UNFINISHED, checkToolCall, schemaErrors,
   convs, dirty, remember, quarantine, retire, dirtyAdd, newRecord, acctOf, ctxKeyOf, isPrefix, withinLimits, sweep,
+  setLastSweepAt: (t) => { lastSweepAt = t }, // 测试钩子: 重置 sweep 节流窗口
   SESSION_HEADER, CTX_VERSION, GAP_MAX_WITH_SESSION, GAP_MAX_NO_SESSION, FRESH_MAX_BYTES,
   HOST, SIGN_SALT, ASSISTANT_ID, VARIANTS,
 }
