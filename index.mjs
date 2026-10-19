@@ -1442,6 +1442,24 @@ export async function ChatglmAuthPlugin({ client }) {
               else opts.signal.addEventListener("abort", onCancel, { once: true })
             }
 
+            // 交付状态机(设计文档 §3): chosenConv 是请求开始就固定的隔离目标快照, 不依赖响应是否回 id。
+            // settle 幂等 —— 一个请求在多阶段失败只处置一次(边界 3)。fetchIssued 区分 not_sent 与 delivery_unknown。
+            const chosenConv = req.conv // "" = 新建
+            let fetchIssued = false
+            let settled = false
+            const settle = (cls) => {
+              if (settled) return
+              settled = true
+              if (cls === "completed") {
+                if (sse.round === ROUND.COMPLETED && sse.conv) remember(sse.conv, req.sig, { acct, ctxKey: req.ctxKey, sessionKey: req.sessionKey })
+                return
+              }
+              if (cls === "not_sent") return // 可证明未提交: 旧 conv 完好, 什么都不动
+              // delivery_unknown: 复用请求隔离快照; 新建请求不写映射, 见过的 id 入 dirty
+              if (chosenConv) quarantine(chosenConv, "delivery-unknown")
+              else if (sse.conv) dirtyAdd(sse.conv)
+            }
+
             // 一轮 = 一次上游流; 空转续写会再发一轮, 复用同一 conversation_id
             const startRound = async (text, convId) => {
               let res = null
@@ -1449,6 +1467,7 @@ export async function ChatglmAuthPlugin({ client }) {
               for (let attempt = 0; attempt < 2; attempt++) {
                 if (cancelled) { const e = new Error("请求已取消"); e.cancelled = true; throw e }
                 try {
+                  fetchIssued = true // 一旦置位, 本请求至少提交过一次 → 之后取消不再算 not_sent
                   res = await fetch(`${HOST}/chatglm/backend-api/assistant/stream`, {
                     method: "POST",
                     headers: signedHeaders({ device: c.device, token: c.token, json: true, sse: true }),
@@ -1500,7 +1519,10 @@ export async function ChatglmAuthPlugin({ client }) {
             } catch (e) {
               // 建流阶段的失败(HTTP/网络/取消)统一成 OpenAI 风格错误体: 抛出去只能落到网关的兜底文案,
               // 客户端无法区分「被取消」与「服务端炸了」
-              if (e?.cancelled) return errorResponse({ status: 499, message: "请求已取消", code: "cancelled" })
+              // 交付分类: 取消且从未发出 fetch → not_sent(旧 conv 不动); 其余(网络抛错/HTTP 错误/
+              // 发出后才取消) → delivery_unknown(rejected 未实测, 保持空集)
+              if (e?.cancelled) { settle(!fetchIssued ? "not_sent" : "delivery_unknown"); return errorResponse({ status: 499, message: "请求已取消", code: "cancelled" }) }
+              settle("delivery_unknown")
               if (e?.status || e?.message) return errorResponse(e)
               throw e
             }
@@ -1518,6 +1540,14 @@ export async function ChatglmAuthPlugin({ client }) {
               total_tokens: promptTokens + outTokens(),
               completion_tokens_details: { reasoning_tokens: estimateTokens(sse.think) },
             })
+
+            // 交付分类(§3.2): completed 提交; 取消且从未发出 fetch = not_sent; 其余一律 delivery_unknown
+            // (rejected 集未实测保持空; TRUNCATED 也算 unknown —— 消息确定已接收但本轮悬挂, §3.4)
+            const deliveryClass = () => {
+              if (sse.round === ROUND.COMPLETED) return "completed"
+              if (sse.round === ROUND.CANCELLED && !fetchIssued) return "not_sent"
+              return "delivery_unknown"
+            }
 
             // 一轮的 SSE 流进 sse; 回合结束(roundDone)就停, 不等连接关闭。
             // 读流异常记 interrupted、正常 EOF 但没完成事件记 incomplete —— 不再静默收尾。
@@ -1621,8 +1651,8 @@ export async function ChatglmAuthPlugin({ client }) {
               if (stalledRound()) await retryRound()
               else if (repeatStalled()) await retryRound(TOOL_NUDGE_REPEAT)
               if (!sse.finished) sse.end()
-              // 只有确认正常完成的回合才提交会话前缀; 成功产出合法工具调用也算完成
-              if (sse.round === ROUND.COMPLETED && sse.conv) remember(sse.conv, req.sig, { acct: req.acct, ctxKey: req.ctxKey, sessionKey: req.sessionKey })
+              // 交付状态机: completed 提交前缀; 截断/错误/中断/不完整/流中取消 → 隔离快照; 未发出取消 → 不动
+              settle(deliveryClass())
               // 失败终态不能伪装成成功的 chat.completion: 返回 OpenAI 风格错误体
               if (sse.outError) {
                 const status = sse.round === ROUND.CANCELLED ? 499 : 502
@@ -1655,7 +1685,7 @@ export async function ChatglmAuthPlugin({ client }) {
                   else if (repeatStalled()) await retryRound(TOOL_NUDGE_REPEAT)
                 } finally { clearInterval(ping); ping = null }
                 if (!sse.finished) sse.end()
-                if (sse.round === ROUND.COMPLETED && sse.conv) remember(sse.conv, req.sig, { acct: req.acct, ctxKey: req.ctxKey, sessionKey: req.sessionKey })
+                settle(deliveryClass())
                 if (DEBUG) log(`chat -> conv=${sse.conv || "?"} round=${sse.round} text=${sse.text.length}ch think=${sse.think.length}ch calls=${sse.calls?.length ?? 0}${sse.error ? ` err=${sse.error}` : ""}`)
                 try {
                   // 失败终态: 流内错误帧 + 关闭, 不发 [DONE] —— OpenAI 官方流式错误同此形态(HTTP 200 后 data 里带 error)。

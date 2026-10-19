@@ -208,5 +208,124 @@ console.log('\n[S1/S6/S14] 端到端: sessionKey 头读取、两任务隔离、�
   globalThis.fetch = realFetch
 }
 
+console.log('\n[步骤3] 交付状态机: 隔离快照 / dirty / not_sent / 单次提交 (端到端)')
+{
+  const AUTH = { type: 'oauth', access: 'test-token', refresh: JSON.stringify({ token: 'test-token', device: 'dev1', guest: false }) }
+  const plugin = await ChatglmAuthPlugin({ client: { app: { log: () => {} } } })
+  const loader = await plugin.auth.loader(async () => AUTH)
+  const realFetch = globalThis.fetch
+  let script = []
+  let sent = []
+  globalThis.fetch = async (url, init) => {
+    if (String(url).includes('/assistant/stream')) {
+      sent.push(JSON.parse(init.body))
+      const next = script.shift()
+      if (!next) throw new Error('test bug: 上游请求超出脚本')
+      if (next instanceof Error) throw next
+      return next
+    }
+    return realFetch(url, init)
+  }
+  const frame = (o) => `data: ${JSON.stringify(o)}\n\n`
+  const okResp = (conv, text = '好的。') => new Response(
+    frame({ conversation_id: conv, status: 'init', parts: [{ logic_id: 'p', status: 'init', content: [{ type: 'text', text }] }] }) +
+    frame({ status: 'finish', parts: [{ logic_id: 'p', status: 'finish', content: [{ type: 'text', text }] }] }),
+    { headers: { 'content-type': 'text/event-stream' } })
+  const call = async (messages, signal, sess = 'sess-Z') => {
+    const res = await loader.fetch('https://chatglm.cn/chatglm/backend-api/assistant/stream', {
+      method: 'POST', headers: { 'content-type': 'application/json', [SESSION_HEADER]: sess },
+      body: JSON.stringify({ model: 'glm-5.3-flash', messages }), signal,
+    })
+    return { status: res.status, body: await res.text() }
+  }
+  const M1 = [sysMsg(), userMsg('看看目录')]
+  const M2 = [sysMsg(), userMsg('看看目录'), { role: 'assistant', content: '好的。' }, userMsg('再读一下')]
+  const M3 = [...M2, { role: 'assistant', content: '好的。' }, userMsg('第三问')]
+
+  // 建立会话: 完成 → 提交 conv-C1
+  convs.clear(); dirty.clear()
+  script = [okResp('conv-C1')]
+  await call(M1)
+  check('前置: 完成轮已提交', convs.has('conv-C1'), true)
+
+  // T-N16: 复用请求在 fetch 发出前被取消 → not_sent → conv 不动, 后续仍可复用
+  {
+    const ac = new AbortController(); ac.abort()
+    sent.length = 0
+    const r = await call(M2, ac.signal)
+    check('not_sent: 返回 499', r.status, 499)
+    check('not_sent: fetch 未发出', sent.length, 0)
+    check('not_sent: conv-C1 未被隔离', convs.get('conv-C1').quarantined, false)
+    script = [okResp('conv-C1')]
+    sent.length = 0
+    await call(M2)
+    check('not_sent 后仍可增量复用', sent[0].conversation_id, 'conv-C1')
+  }
+
+  // T-N2: 复用请求 fetch 网络抛错(无新 conv id) → 隔离快照 conv-C1
+  {
+    script = [new Error('连接被重置'), new Error('连接被重置')] // 两次 attempt 都失败
+    const r = await call(M3)
+    check('建流失败 → 502', r.status, 502)
+    check('T-N2: 快照 conv-C1 被隔离', convs.get('conv-C1').quarantined, true)
+    check('隔离原因', convs.get('conv-C1').qreason, 'delivery-unknown')
+    // 后续同历史请求: 不复用隔离的 C1, 全史内联新建
+    script = [okResp('conv-C2')]
+    sent.length = 0
+    await call(M3)
+    check('隔离后不复用(内联新建)', sent[0].conversation_id, '')
+    check('内联文本含完整历史', /看看目录/.test(sent[0].messages[0].content[0].text) && /第三问/.test(sent[0].messages[0].content[0].text), true)
+  }
+
+  // T-N11: 隔离的 conv 不被迟到的 completed 复活(remember 棘轮)
+  {
+    script = [okResp('conv-C1')] // 响应声称是 C1 的完成轮
+    await call([...M3, { role: 'assistant', content: '好的。' }, userMsg('换个问法')], undefined, 'sess-Z')
+    check('迟到 completed 不复活隔离记录', convs.get('conv-C1').quarantined, true)
+  }
+
+  // T-N3: 新建请求 EOF 无完成帧(曾见过响应 conv id) → 不写映射, id 入 dirty
+  {
+    convs.clear(); dirty.clear()
+    script = [new Response(frame({ conversation_id: 'conv-D3', status: 'init', parts: [{ logic_id: 'p', status: 'init', content: [{ type: 'text', text: '半句' }] }] }), { headers: { 'content-type': 'text/event-stream' } })]
+    const r = await call(M1)
+    check('T-N3: 无完成帧 EOF → 502', r.status, 502)
+    check('见过的 id 不入映射', convs.has('conv-D3'), false)
+    check('见过的 id 入 dirty', dirty.has('conv-D3'), true)
+    // dirty 永不参与匹配: 再来同请求不得复用 conv-D3
+    script = [okResp('conv-D4')]
+    sent.length = 0
+    await call(M1)
+    check('dirty 不参与匹配(新建而非复用)', sent[0].conversation_id, '')
+  }
+
+  // T-N15: 复用请求的响应回了不同的新 id 后报错 → 隔离的是快照 E1(不依赖响应), 新 id 不入映射
+  {
+    convs.clear(); dirty.clear()
+    script = [okResp('conv-E1')]
+    await call(M1)
+    script = [new Response(
+      frame({ conversation_id: 'conv-E9', status: 'init', parts: [{ logic_id: 'p', status: 'init', content: [{ type: 'text', text: '甲' }] }] }) +
+      frame({ status: 'error', last_error: { message: 'boom' } }),
+      { headers: { 'content-type': 'text/event-stream' } })]
+    await call(M2)
+    check('T-N15: 隔离的是快照 E1 而非响应 id E9', convs.get('conv-E1')?.quarantined, true)
+    check('复用请求不把响应新 id 写进映射', convs.has('conv-E9'), false)
+  }
+
+  // T-N12: 多阶段失败只处置一次(建流两次都抛 → 单次 settle, 无二次崩溃)
+  {
+    convs.clear(); dirty.clear()
+    script = [okResp('conv-F1')]
+    await call(M1)
+    const tsBefore = convs.get('conv-F1').ts
+    script = [new Error('reset'), new Error('reset')]
+    const r = await call(M2)
+    check('T-N12: 双阶段失败仍只产出一个 502', r.status, 502)
+    check('隔离只发生一次(ts 已置位)', convs.get('conv-F1').quarantined && convs.get('conv-F1').ts >= tsBefore, true)
+  }
+  globalThis.fetch = realFetch
+}
+
 console.log(`\n结果: ${pass} 通过, ${fail} 失败`)
 process.exit(fail ? 1 : 0)
