@@ -327,5 +327,111 @@ console.log('\n[步骤3] 交付状态机: 隔离快照 / dirty / not_sent / 单�
   globalThis.fetch = realFetch
 }
 
+console.log('\n[步骤4] 并发: busy 全生命周期 / 多候选重建 / 隔离不被他人解除 (端到端)')
+{
+  const AUTH = { type: 'oauth', access: 'test-token', refresh: JSON.stringify({ token: 'test-token', device: 'dev1', guest: false }) }
+  const plugin = await ChatglmAuthPlugin({ client: { app: { log: () => {} } } })
+  const loader = await plugin.auth.loader(async () => AUTH)
+  const realFetch = globalThis.fetch
+  let script = []
+  let sent = []
+  globalThis.fetch = async (url, init) => {
+    if (String(url).includes('/assistant/stream')) {
+      sent.push(JSON.parse(init.body))
+      const next = script.shift()
+      if (!next) throw new Error('test bug: 上游请求超出脚本')
+      if (next instanceof Error) throw next
+      return next
+    }
+    return realFetch(url, init)
+  }
+  const frame = (o) => `data: ${JSON.stringify(o)}\n\n`
+  const okResp = (conv, text = '好的。') => new Response(
+    frame({ conversation_id: conv, status: 'init', parts: [{ logic_id: 'p', status: 'init', content: [{ type: 'text', text }] }] }) +
+    frame({ status: 'finish', parts: [{ logic_id: 'p', status: 'finish', content: [{ type: 'text', text }] }] }),
+    { headers: { 'content-type': 'text/event-stream' } })
+  // 可控流: 手动推 init 帧与 finish 帧, 精确编排「A 还在读时 B 到达」的时序
+  const controllable = (conv) => {
+    let ctrl
+    const rs = new ReadableStream({ start(c) { ctrl = c } })
+    const resp = new Response(rs, { headers: { 'content-type': 'text/event-stream' } })
+    return {
+      resp,
+      init() { ctrl.enqueue(new TextEncoder().encode(frame({ conversation_id: conv, status: 'init', parts: [{ logic_id: 'p', status: 'init', content: [{ type: 'text', text: '好的' }] }] }))) },
+      finish() { ctrl.enqueue(new TextEncoder().encode(frame({ status: 'finish', parts: [{ logic_id: 'p', status: 'finish', content: [{ type: 'text', text: '好的。' }] }] }))); ctrl.close() },
+    }
+  }
+  const call = async (messages, sess = 'sess-W') => {
+    const res = await loader.fetch('https://chatglm.cn/chatglm/backend-api/assistant/stream', {
+      method: 'POST', headers: { 'content-type': 'application/json', [SESSION_HEADER]: sess },
+      body: JSON.stringify({ model: 'glm-5.3-flash', stream: true, messages }),
+    })
+    return res.text() // 消费到流关闭
+  }
+  const tick = () => new Promise((r) => setImmediate(r))
+  const waitFor = async (fn, ms = 2000) => { const t0 = Date.now(); while (!fn()) { if (Date.now() - t0 > ms) throw new Error('waitFor 超时'); await tick() } }
+  const M1 = [sysMsg(), userMsg('看看目录')]
+  const M2 = [sysMsg(), userMsg('看看目录'), { role: 'assistant', content: '好的。' }, userMsg('再读一下')]
+  const M3 = [...M2, { role: 'assistant', content: '好的。' }, userMsg('第三问')]
+
+  // T-N8 + T-N4 + T-N6: A 复用 C1 在途 → busy 挡住 B(重建 C2) → 都完成后第三请求见双候选 → 重建权威
+  convs.clear(); dirty.clear()
+  script = [okResp('conv-C1')]
+  await call(M1) // 建立: C1.sig=[h1]
+  check('前置: C1 已提交', convs.get('conv-C1').sig.length, 1)
+
+  const ctlA = controllable('conv-C1')
+  script = [ctlA.resp]
+  const pA = call(M2) // A: 复用 C1, 流挂起
+  await waitFor(() => convs.get('conv-C1').busy === 1)
+  check('T-N8: 流在途时 busy=1', convs.get('conv-C1').busy, 1)
+  ctlA.init()
+  await waitFor(() => convs.get('conv-C1').busy === 1) // init 帧到达后仍不得归零
+  check('T-N8: 收到 init 帧 busy 仍不归零', convs.get('conv-C1').busy, 1)
+
+  sent.length = 0
+  const ctlB = controllable('conv-C2')
+  script = [ctlB.resp] // 必须在发起前入队: loader.fetch 同步取脚本
+  const pB = call(M3) // B: 同 sessionKey, C1 busy → 拒绝复用, 重建
+  await waitFor(() => sent.length === 1)
+  check('T-N8: B 见 busy 不复用(新建)', sent[0].conversation_id, '')
+  ctlB.init()
+
+  // 收尾 A、B: 都正常完成
+  ctlA.finish()
+  await pA
+  check('T-N4: A 完成后 busy 归零', convs.get('conv-C1').busy, 0)
+  check('T-N4: A 提交增量 sig', convs.get('conv-C1').sig.length, 2)
+  ctlB.finish()
+  await pB
+  check('T-N4: B 的 C2 已提交', convs.get('conv-C2')?.sig.length >= 1, true)
+
+  // 第三请求: C1 与 C2 都是其前缀 → 多候选 → 不比较, 重建权威, 双退役
+  sent.length = 0
+  script = [okResp('conv-C3')]
+  await call(M3)
+  check('T-N6: 多候选不任意选择(第三请求新建)', sent[0].conversation_id, '')
+  check('T-N4: 旧候选双双退役 branched', [convs.get('conv-C1')?.retired, convs.get('conv-C2')?.retired], ['branched', 'branched'])
+  // 第四请求: 新权威 C3 正常增量复用
+  sent.length = 0
+  script = [okResp('conv-C3')]
+  await call([...M3, { role: 'assistant', content: '好的。' }, userMsg('第四问')])
+  check('T-N4: 权威会话后续正常增量', sent[0].conversation_id, 'conv-C3')
+
+  // T-N10: 隔离不被其他请求解除
+  convs.clear(); dirty.clear()
+  script = [okResp('conv-D1')]
+  await call(M1)
+  script = [new Error('reset'), new Error('reset')]
+  await call(M2) // 失败 → D1 隔离
+  check('前置: D1 已隔离', convs.get('conv-D1').quarantined, true)
+  const tsD1 = convs.get('conv-D1').ts
+  script = [okResp('conv-D2')]
+  await call(M2) // 另一请求在新会话上成功
+  check('T-N10: 他人完成不解除 D1 隔离', convs.get('conv-D1').quarantined && convs.get('conv-D1').ts === tsD1, true)
+  check('T-N10: 新会话 D2 正常可用', convs.get('conv-D2').quarantined, false)
+  globalThis.fetch = realFetch
+}
+
 console.log(`\n结果: ${pass} 通过, ${fail} 失败`)
 process.exit(fail ? 1 : 0)

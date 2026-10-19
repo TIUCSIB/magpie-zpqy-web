@@ -1459,6 +1459,11 @@ export async function ChatglmAuthPlugin({ client }) {
               if (chosenConv) quarantine(chosenConv, "delivery-unknown")
               else if (sse.conv) dirtyAdd(sse.conv)
             }
+            // busy 覆盖整条上游流(§6.1): 选定复用即占用, settle 定局后/下游断开时幂等释放。
+            // 语义是「拒绝复用」而非排队 —— 其他请求见 busy>0 走重建, 永不互相阻塞。
+            if (chosenConv) busyAdd(chosenConv)
+            let busyReleased = false
+            const releaseBusy = () => { if (!busyReleased) { busyReleased = true; if (chosenConv) busySub(chosenConv) } }
 
             // 一轮 = 一次上游流; 空转续写会再发一轮, 复用同一 conversation_id
             const startRound = async (text, convId) => {
@@ -1521,8 +1526,9 @@ export async function ChatglmAuthPlugin({ client }) {
               // 客户端无法区分「被取消」与「服务端炸了」
               // 交付分类: 取消且从未发出 fetch → not_sent(旧 conv 不动); 其余(网络抛错/HTTP 错误/
               // 发出后才取消) → delivery_unknown(rejected 未实测, 保持空集)
-              if (e?.cancelled) { settle(!fetchIssued ? "not_sent" : "delivery_unknown"); return errorResponse({ status: 499, message: "请求已取消", code: "cancelled" }) }
+              if (e?.cancelled) { settle(!fetchIssued ? "not_sent" : "delivery_unknown"); releaseBusy(); return errorResponse({ status: 499, message: "请求已取消", code: "cancelled" }) }
               settle("delivery_unknown")
+              releaseBusy()
               if (e?.status || e?.message) return errorResponse(e)
               throw e
             }
@@ -1653,6 +1659,7 @@ export async function ChatglmAuthPlugin({ client }) {
               if (!sse.finished) sse.end()
               // 交付状态机: completed 提交前缀; 截断/错误/中断/不完整/流中取消 → 隔离快照; 未发出取消 → 不动
               settle(deliveryClass())
+              releaseBusy() // 非流式: 到这里上游流生命周期已结束
               // 失败终态不能伪装成成功的 chat.completion: 返回 OpenAI 风格错误体
               if (sse.outError) {
                 const status = sse.round === ROUND.CANCELLED ? 499 : 502
@@ -1686,6 +1693,7 @@ export async function ChatglmAuthPlugin({ client }) {
                 } finally { clearInterval(ping); ping = null }
                 if (!sse.finished) sse.end()
                 settle(deliveryClass())
+                releaseBusy() // 流式: pump+retry+end 全部结束, 上游流生命周期到此为止
                 if (DEBUG) log(`chat -> conv=${sse.conv || "?"} round=${sse.round} text=${sse.text.length}ch think=${sse.think.length}ch calls=${sse.calls?.length ?? 0}${sse.error ? ` err=${sse.error}` : ""}`)
                 try {
                   // 失败终态: 流内错误帧 + 关闭, 不发 [DONE] —— OpenAI 官方流式错误同此形态(HTTP 200 后 data 里带 error)。
@@ -1706,6 +1714,7 @@ export async function ChatglmAuthPlugin({ client }) {
               cancel() {
                 onCancel()
                 if (ping) { clearInterval(ping); ping = null }
+                releaseBusy() // 幂等: 与 start 的释放二选一生效(下游先断开时 start 可能还挂在 pump)
               },
             })
             return new Response(out, { status: 200, headers: keepHeaders })
