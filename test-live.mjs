@@ -13,7 +13,9 @@ if (!fs.existsSync(authFile)) {
   console.error(`找不到 ${authFile} —— 先用 magpie 登录清言, 或设 MAGPIE_AUTH_FILE 指向别的账号文件`)
   process.exit(1)
 }
-const auth = JSON.parse(fs.readFileSync(authFile, 'utf8')).chatglm
+const store = JSON.parse(fs.readFileSync(authFile, 'utf8'))
+// magpie 按 accountId 分键存储(如 chatglm#cldwdz), 也兼容裸 chatglm 键
+const auth = store.chatglm || Object.entries(store).find(([k]) => k.startsWith('chatglm#'))?.[1]
 if (!auth) {
   console.error(`${authFile} 里没有 chatglm 账号`)
   process.exit(1)
