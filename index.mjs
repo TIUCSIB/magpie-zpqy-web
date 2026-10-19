@@ -521,15 +521,92 @@ function estimateTokens(s) {
   return cjk + Math.ceil(other / 4)
 }
 
-// 会话映射: conv id → 已发出的「我方回合」指纹(见 translateRequest)。上下文由清言服务端保存。
+// 会话映射: conv id → 回合记录(record)。上下文由清言服务端保存, 这里只记「已确认发出」的前缀。
+// 记录形状(设计文档 §9.1): { sig, acct, ctxKey, sessionKey, busy, quarantined, retired, ts, lastUsed }
+// 三态语义分离(边界 4): quarantined=本进程选定但交付不确定; retired=本进程主动退出的映射;
+// dirty=新建请求不确定交付时从响应里见过的 id(从未确认归属, 永不参与匹配)。
+// SESSION_HEADER: chat.headers 钩子把宿主 sessionID 带进请求头, loader.fetch 读回即删、不发上游。
 const convs = new Map()
+const SESSION_HEADER = "x-magpie-chatglm-session"
+const dirty = new Map() // convId -> 记入时刻
 const CONV_MAX = 48
+const DIRTY_MAX = 48
+const DIRTY_TTL_MS = 3600_000                       // dirty 观察集 1h 过期
+const QUARANTINE_TTL_MS = 24 * 3600_000             // 隔离/退役记录 24h 后整条删除(过期=删除, 不解封)
+const GAP_MAX_WITH_SESSION = 64                     // 有 sessionKey: 增量消息数上限
+const GAP_MAX_NO_SESSION = 8                        // 无头: 保留旧启发式
+const FRESH_MAX_BYTES = 512 * 1024                  // 增量字节上限
+const STALE_MS = () => Number(process.env.CHATGLM_CONV_STALE_MS || 0) || 30 * 60_000 // 耗时保护
+const CTX_VERSION = 1                               // 协议文本(TOOL_PROTOCOL/渲染格式)变更时 bump
 
-function remember(conv, sig) {
+function newRecord(meta = {}) {
+  return {
+    sig: [],
+    acct: meta.acct ?? "",
+    ctxKey: meta.ctxKey ?? "",
+    sessionKey: meta.sessionKey ?? "",
+    busy: 0,
+    quarantined: false,
+    retired: null,
+    ts: 0,
+    lastUsed: Date.now(),
+  }
+}
+// 兼容读: 旧用法把值直接存成 sig 数组(旧测试/旧 remember), 统一升格成 record
+function readRec(v) { return Array.isArray(v) ? { ...newRecord(), sig: v } : v }
+function normRec(conv) { const v = convs.get(conv); if (!v) return null; const r = readRec(v); convs.set(conv, r); return r }
+
+function quarantine(conv, reason) {
+  const r = normRec(conv)
+  if (!r || r.quarantined || r.retired) return // 棘轮: 已是终局不再改, 也不被他人解除
+  r.quarantined = true; r.qreason = reason; r.ts = Date.now()
+}
+function retire(conv, reason) {
+  const r = normRec(conv)
+  if (!r || r.retired) return
+  r.retired = reason; r.ts = Date.now()
+}
+function dirtyAdd(conv) {
+  if (!conv) return
+  dirty.set(conv, Date.now())
+  while (dirty.size > DIRTY_MAX) dirty.delete(dirty.keys().next().value)
+}
+function busyAdd(conv) { const r = normRec(conv); if (r) r.busy++ }
+function busySub(conv) { const r = normRec(conv); if (r && r.busy > 0) r.busy-- }
+
+// 清理顺序固定(§9.3): dirty TTL → 隔离/退役整条删除 → active 按 lastUsed LRU。
+// 只产生删除, 不产生状态降级 —— 已隔离会话不存在「洗白回正常映射」的路径。
+function sweep() {
+  const now = Date.now()
+  for (const [k, t] of dirty) if (now - t > DIRTY_TTL_MS) dirty.delete(k)
+  for (const [k, v] of convs) {
+    const r = readRec(v)
+    if ((r.quarantined || r.retired) && now - (r.ts || 0) > QUARANTINE_TTL_MS) convs.delete(k)
+  }
+  while (convs.size > CONV_MAX) {
+    let oldest = null, ot = Infinity
+    for (const [k, v] of convs) { const lu = readRec(v).lastUsed; if (lu < ot) { ot = lu; oldest = k } }
+    if (oldest == null) break
+    convs.delete(oldest)
+  }
+}
+
+// 提交会话前缀。棘轮(§6.4): 目标 conv 已被隔离/退役时拒写 —— 迟到的 completed 不复活终局记录。
+// meta 省略字段沿用旧记录(兼容旧测试的 remember(conv, sig) 两参调用)。
+function remember(conv, sig, meta) {
   if (!conv || !Array.isArray(sig)) return
-  convs.delete(conv) // 重新插入, 保持 LRU 顺序
-  convs.set(conv, sig)
-  while (convs.size > CONV_MAX) convs.delete(convs.keys().next().value)
+  const prev = convs.get(conv)
+  if (prev) {
+    const r = readRec(prev)
+    if (r.quarantined || r.retired) return
+    r.sig = sig
+    r.lastUsed = Date.now()
+    if (meta) { if (meta.acct != null) r.acct = meta.acct; if (meta.ctxKey != null) r.ctxKey = meta.ctxKey; if (meta.sessionKey != null) r.sessionKey = meta.sessionKey }
+    convs.delete(conv); convs.set(conv, r)
+  } else {
+    convs.set(conv, { ...newRecord(meta), sig, lastUsed: Date.now() })
+  }
+  sweep()
 }
 
 // ---- 工具调用 -----------------------------------------------------------------------
@@ -866,35 +943,108 @@ function failedCallKeys(messages) {
   return out
 }
 
+// ---- 会话身份与上下文指纹(设计文档 §5/§8) --------------------------------------------
+
+const sha256hex = (s) => crypto.createHash("sha256").update(s).digest("hex")
+
+// 账号隔离键: 完整稳定 uid 的摘要优先(换 token 不换 uid → 映射跨续期存活);
+// 无 uid 退回凭据摘要(token 轮换 → acct 变 → 旧 conv 失效, 安全优先的有意取舍)。
+// 禁用: uid 后 6 位(可碰撞)、api 登录每请求随机的 device。凭据本身不落日志。
+function acctOf(token) {
+  const uid = jwtIsGuest(token || "").uid
+  return uid ? sha256hex(`uid:${uid}`).slice(0, 16) : sha256hex(`cred:${md5hex(String(token || ""))}`).slice(0, 16)
+}
+
+// 上下文指纹: 结构化规范对象做哈希输入(JSON 序列化天然带字段边界, 不拼裸字符串)。
+// 进指纹: sys(有序+角色边界) / 有效工具集(按名排序+schema 键排序) / model / effort / CTX_VERSION。
+// 不进指纹(单次调用设置): temperature/top_p/seed/max_tokens/stop(网页协议忽略),
+// stream/stream_options(传输方式), tool_choice 模式值(每轮现拼强制文案), user/metadata(无证据影响上游)。
+function ctxKeyOf({ sys, tools, model, effort }) {
+  const payload = {
+    v: CTX_VERSION,
+    sys: (Array.isArray(sys) ? sys : []).map((m) => ({ role: m.role, text: m.text })),
+    tools: (Array.isArray(tools) ? tools : [])
+      .slice()
+      .sort((a, b) => String(a.function.name).localeCompare(String(b.function.name)))
+      .map((t) => ({ name: t.function.name, description: t.function.description ?? "", parameters: canonArgs(t.function.parameters ?? {}) })),
+    model, effort,
+  }
+  return sha256hex(JSON.stringify(payload)).slice(0, 24)
+}
+
+const isPrefix = (sent, sig) => sent.length <= sig.length && sent.every((h, i) => h === sig[i])
+
+// 增量三重保护(决策 2): 消息数 / 体积 / 耗时。sessionKey 在场时消息数放宽到 64。
+function withinLimits(gap, freshBytes, rec, hasSession) {
+  if (gap > (hasSession ? GAP_MAX_WITH_SESSION : GAP_MAX_NO_SESSION)) return false
+  if (freshBytes > FRESH_MAX_BYTES) return false
+  if (Date.now() - (rec.lastUsed || 0) > STALE_MS()) return false
+  return true
+}
+
 // 决定 conversation_id 与要发送的清言用户文本。
-// 复用: 已发出的「我方回合」(user + 工具结果) 是本次的前缀 → 只补发新增的那些;
-//       中间的 assistant 回合不算 —— 那是清言服务端自己生成的。
-// 兜底: 对不上(新会话 / agent 换了上下文 / 历史被压缩)→ 新会话, system+工具协议+历史 内联合并。
-function translateRequest(openai, tools) {
+// 复用(设计文档 §4): 六条件过滤候选 → 唯一候选且增量三重保护通过 → 只补发新增回合;
+//   候选 >1 → 不比较谁更长谁更新, 直接重建(§4.4); 前缀不成立 → 禁止 slice, 退役重建(§4.2)。
+// 兜底: 对不上(新会话 / 上下文变 / 历史被压缩)→ 新会话, system+工具协议+历史 内联合并。
+// ctx 默认 {} → acct/ctxKey/sessionKey 皆空, 与旧 remember(conv,sig) 两参调用兼容。
+function translateRequest(openai, tools, ctx = {}) {
   const msgs = Array.isArray(openai.messages) ? openai.messages : []
-  const sys = msgs.filter((m) => m.role === "system" || m.role === "developer").map((m) => textOf(m.content)).filter(Boolean).join("\n\n")
+  const sysText = msgs.filter((m) => m.role === "system" || m.role === "developer").map((m) => textOf(m.content)).filter(Boolean).join("\n\n")
+  const sysParts = msgs.filter((m) => m.role === "system" || m.role === "developer").map((m) => ({ role: m.role === "developer" ? "developer" : "system", text: textOf(m.content) })).filter((m) => m.text)
   const turns = msgs.filter((m) => m.role !== "system" && m.role !== "developer").map(renderTurn)
   const mine = turns.filter((t) => t.role !== "assistant")
   const sig = mine.map((t) => md5hex(t.text))
   const blocked = failedCallKeys(msgs)
   // 计账用的完整上下文: 系统提示 + 工具清单 + 全部回合(含 assistant)。与实际发什么无关 ——
   // 发的是增量还是全量只是传输方式, 客户端的上下文总量是一样的。
-  const fullText = [sys && `# 系统指令(必须遵循)\n${sys}`, tools.length && TOOL_PROTOCOL(tools), ...turns.map((t) => t.text)].filter(Boolean).join("\n\n")
+  const fullText = [sysText && `# 系统指令(必须遵循)\n${sysText}`, tools.length && TOOL_PROTOCOL(tools), ...turns.map((t) => t.text)].filter(Boolean).join("\n\n")
 
-  let best = null
-  for (const [conv, sent] of convs) {
-    if (!sent.length || sent.length > sig.length) continue
-    if (sig.length - sent.length > 8) continue // 一次补太多说明历史对不上, 不如重开
-    if (!sent.every((h, i) => h === sig[i])) continue
-    if (!best || sent.length > best.sent.length) best = { conv, sent }
+  // 本请求的上下文指纹(与 conv 首条内联注入的上下文对应)。
+  // ctx 整体缺省(旧两参调用/无 ctx 环境) → 指纹全空, 退化为「仅前缀+gap」的旧语义 —— 门控只约束带 ctx 的请求。
+  const hasCtx = !!ctx && (ctx.acct != null || ctx.sessionKey != null || ctx.ctxKey != null || ctx.model != null)
+  const reqCtxKey = ctx.ctxKey ?? (hasCtx ? ctxKeyOf({ sys: sysParts, tools, model: ctx.model ?? "", effort: ctx.effort ?? "" }) : "")
+  const reqAcct = ctx.acct ?? ""
+  const reqSession = ctx.sessionKey ?? ""
+
+  // 六条件过滤(§4.1): acct / ctxKey / 未隔离未退役 / 无在途 / sessionKey 一致(有头才查) / 前缀成立
+  const cands = []
+  for (const [conv, v] of convs) {
+    const rec = readRec(v)
+    if (!rec.sig.length) continue
+    if (rec.quarantined || rec.retired) continue
+    if (rec.busy > 0) continue
+    if (rec.acct !== reqAcct || rec.ctxKey !== reqCtxKey) continue
+    if (reqSession && rec.sessionKey !== reqSession) continue
+    if (!isPrefix(rec.sig, sig)) continue
+    cands.push([conv, rec])
   }
-  if (best && sig.length > best.sent.length) {
-    const fresh = mine.slice(best.sent.length)
-    // 这轮要发的工具结果里有报错 → 把「禁止原样重发」在当轮消息里重新钉一遍
-    const errored = fresh.some((t) => t.role === "tool" && TOOL_ERR_RE.test(t.text))
-    let text = fresh.map((t, i) => (t.role === "tool" && i === fresh.length - 1 ? `${t.text}\n\n${TOOL_REMINDER}` : t.text)).join("\n\n")
-    if (errored) text += `\n\n${TOOL_ERR_REMINDER}`
-    return { conv: best.conv, text, sig, fullText, blocked }
+  // 决策 3: 多候选不比较, 直接重建; 旧分支退役
+  if (cands.length > 1) {
+    for (const [conv] of cands) retire(conv, "branched")
+  } else if (cands.length === 1) {
+    const [conv, rec] = cands[0]
+    const gap = sig.length - rec.sig.length
+    const fresh = mine.slice(rec.sig.length)
+    const freshBytes = fresh.reduce((n, t) => n + Buffer.byteLength(t.text, "utf8"), 0)
+    if (gap > 0 && withinLimits(gap, freshBytes, rec, !!reqSession)) {
+      // 这轮要发的工具结果里有报错 → 把「禁止原样重发」在当轮消息里重新钉一遍
+      const errored = fresh.some((t) => t.role === "tool" && TOOL_ERR_RE.test(t.text))
+      let text = fresh.map((t, i) => (t.role === "tool" && i === fresh.length - 1 ? `${t.text}\n\n${TOOL_REMINDER}` : t.text)).join("\n\n")
+      if (errored) text += `\n\n${TOOL_ERR_REMINDER}`
+      return { conv, text, sig, fullText, blocked, ctxKey: reqCtxKey, acct: reqAcct, sessionKey: reqSession }
+    }
+    // 唯一候选但增量超限(消息数/体积/耗时) → 退役重建
+    retire(conv, "stale-or-oversized")
+  }
+  // 前缀不成立但存在 acct/ctx/session 一致、未隔离的旧 conv(历史被压缩/裁剪/分叉) → 退役(决策 2)
+  if (cands.length === 0) {
+    for (const [conv, v] of convs) {
+      const rec = readRec(v)
+      if (rec.quarantined || rec.retired || rec.busy > 0) continue
+      if (rec.acct !== reqAcct || rec.ctxKey !== reqCtxKey) continue
+      if (reqSession && rec.sessionKey !== reqSession) continue
+      if (rec.sig.length && !isPrefix(rec.sig, sig)) retire(conv, "history-diverged")
+    }
   }
 
   const hist = turns
@@ -903,13 +1053,13 @@ function translateRequest(openai, tools) {
     .join("\n\n")
   const last = turns.length ? turns[turns.length - 1].text : ""
   const parts = []
-  if (sys) parts.push(`# 系统指令(必须遵循)\n${sys}`)
+  if (sysText) parts.push(`# 系统指令(必须遵循)\n${sysText}`)
   if (tools.length) parts.push(TOOL_PROTOCOL(tools))
   if (hist) parts.push(`# 对话历史(接续)\n${hist}`)
   parts.push(`# 本轮用户消息\n${last || "(空)"}`)
   // 重开会话时历史全量内联, 只看最近几条工具结果, 太久的报错不再提醒
   if (turns.slice(-6).some((t) => t.role === "tool" && TOOL_ERR_RE.test(t.text))) parts.push(TOOL_ERR_REMINDER)
-  return { conv: "", text: parts.join("\n\n"), sig, fullText, blocked }
+  return { conv: "", text: parts.join("\n\n"), sig, fullText, blocked, ctxKey: reqCtxKey, acct: reqAcct, sessionKey: reqSession }
 }
 
 // 清言 SSE 事件 → OpenAI chat.completion.chunk。
@@ -1133,6 +1283,15 @@ export async function ChatglmAuthPlugin({ client }) {
       cfg.provider[PROVIDER] = { npm: "@ai-sdk/openai-compatible", api: HOST, ...was, name: LABEL, models: { ...models, ...(was.models ?? {}) } }
     },
 
+    // 宿主会话头: magpie/OpenCode 在每次对话前调用本钩子(input.sessionID 实测存在, 见设计文档 §11.1)。
+    // 把 sessionID 注进请求头, loader.fetch 读回后立即删除 —— 头不出本机, 更不发清言。
+    // 判 provider 用 providerID(modelID 实测为 undefined)。
+    "chat.headers": async (input, output) => {
+      const id = input?.model?.providerID ?? input?.provider?.info?.id
+      if (id !== PROVIDER || !input?.sessionID) return
+      output.headers[SESSION_HEADER] = String(input.sessionID).slice(0, 128)
+    },
+
     auth: {
       provider: PROVIDER,
       methods: [
@@ -1231,11 +1390,8 @@ export async function ChatglmAuthPlugin({ client }) {
             let tools = tc === "none" ? [] : normalizeTools(openai.tools)
             // OpenAI 兼容: 指定函数时只把那个函数放进协议, required 时强制本轮必须出调用
             if (tc && typeof tc === "object" && tc.function?.name) tools = tools.filter((t) => t.function.name === tc.function.name)
-            const req = translateRequest(openai, tools)
-            if ((tc === "required" || (tc && typeof tc === "object")) && tools.length) {
-              req.text += `\n\n# 强制\n本轮必须输出 {"tool_calls":[...]} 开始执行, 禁止纯文本回答。${tc?.function?.name ? `使用工具 ${tc.function.name}。` : ""}`
-            }
             // 档位来源: magpie variants 走 reasoning_effort 字段; 也认模型 id 后缀(:high/:max)
+            // (先解析 model/effort: ctxKey 要含这两项, 必须在 translateRequest 之前)
             let model = openai.model || "glm-5.3-flash"
             let effort = ""
             const suffix = model.match(/:(low|high|max)$/i)
@@ -1243,6 +1399,16 @@ export async function ChatglmAuthPlugin({ client }) {
             effort = String(openai.reasoning_effort || openai.reasoningEffort || openai.effort || effort || "").toLowerCase()
             if (!EFFORTS.includes(effort)) effort = DEFAULT_EFFORT
             const mode = EFFORT_TO_META[effort]
+            // 会话身份: acct=账号摘要; sessionKey=chat.headers 注进来的宿主会话头(读回即删, 不发上游)
+            const acct = acctOf(c.token)
+            const reqHeaders = new Headers(init?.headers ?? (input instanceof Request ? input.headers : undefined))
+            const hostSession = String(reqHeaders.get(SESSION_HEADER) ?? "").trim()
+            reqHeaders.delete(SESSION_HEADER)
+            const sessionKey = hostSession ? sha256hex(`session:${hostSession}`).slice(0, 24) : ""
+            const req = translateRequest(openai, tools, { acct, sessionKey, model, effort })
+            if ((tc === "required" || (tc && typeof tc === "object")) && tools.length) {
+              req.text += `\n\n# 强制\n本轮必须输出 {"tool_calls":[...]} 开始执行, 禁止纯文本回答。${tc?.function?.name ? `使用工具 ${tc.function.name}。` : ""}`
+            }
             if (DEBUG) log(`chat <- msgs=${openai.messages?.length ?? 0} tools=${tools.length} effort=${effort} model=${model} conv=${req.conv || "(new)"} text=${req.text.length}ch`)
             const glmBody = (text, convId) => JSON.stringify({
               assistant_id: ASSISTANT_ID,
@@ -1456,7 +1622,7 @@ export async function ChatglmAuthPlugin({ client }) {
               else if (repeatStalled()) await retryRound(TOOL_NUDGE_REPEAT)
               if (!sse.finished) sse.end()
               // 只有确认正常完成的回合才提交会话前缀; 成功产出合法工具调用也算完成
-              if (sse.round === ROUND.COMPLETED && sse.conv) remember(sse.conv, req.sig)
+              if (sse.round === ROUND.COMPLETED && sse.conv) remember(sse.conv, req.sig, { acct: req.acct, ctxKey: req.ctxKey, sessionKey: req.sessionKey })
               // 失败终态不能伪装成成功的 chat.completion: 返回 OpenAI 风格错误体
               if (sse.outError) {
                 const status = sse.round === ROUND.CANCELLED ? 499 : 502
@@ -1489,7 +1655,7 @@ export async function ChatglmAuthPlugin({ client }) {
                   else if (repeatStalled()) await retryRound(TOOL_NUDGE_REPEAT)
                 } finally { clearInterval(ping); ping = null }
                 if (!sse.finished) sse.end()
-                if (sse.round === ROUND.COMPLETED && sse.conv) remember(sse.conv, req.sig)
+                if (sse.round === ROUND.COMPLETED && sse.conv) remember(sse.conv, req.sig, { acct: req.acct, ctxKey: req.ctxKey, sessionKey: req.sessionKey })
                 if (DEBUG) log(`chat -> conv=${sse.conv || "?"} round=${sse.round} text=${sse.text.length}ch think=${sse.think.length}ch calls=${sse.calls?.length ?? 0}${sse.error ? ` err=${sse.error}` : ""}`)
                 try {
                   // 失败终态: 流内错误帧 + 关闭, 不发 [DONE] —— OpenAI 官方流式错误同此形态(HTTP 200 后 data 里带 error)。
@@ -1570,10 +1736,12 @@ export async function ChatglmAuthPlugin({ client }) {
 // 单测入口(对象不是函数, 不会被 magpie 当作插件)
 export const _internal = {
   luhnStamp, md5hex, uuid32, signedHeaders, credsOf, parseCookies, translateRequest,
-  ChatglmSSE, textOf, remember, convs, findBrowser, jwtIsGuest, browserFlow,
+  ChatglmSSE, textOf, findBrowser, jwtIsGuest, browserFlow,
   normalizeTools, parseToolCalls, sliceJsonObject, looseJson, jsonClosed, renderTurn, estimateTokens,
   looksStalled, repairJson, TOOL_NUDGE, TOOL_NUDGE_BROKEN, MAX_OUTPUT_CHARS,
   callKey, failedCallKeys, TOOL_ERR_RE, TOOL_ERR_REMINDER, TOOL_NUDGE_REPEAT,
   ROUND, ROUND_UNFINISHED, checkToolCall, schemaErrors,
+  convs, dirty, remember, quarantine, retire, dirtyAdd, newRecord, acctOf, ctxKeyOf, isPrefix, withinLimits, sweep,
+  SESSION_HEADER, CTX_VERSION, GAP_MAX_WITH_SESSION, GAP_MAX_NO_SESSION, FRESH_MAX_BYTES,
   HOST, SIGN_SALT, ASSISTANT_ID, VARIANTS,
 }

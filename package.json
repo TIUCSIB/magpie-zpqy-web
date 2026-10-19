@@ -10,7 +10,7 @@
     "README.md"
   ],
   "scripts": {
-    "test": "node test-toolcalls.mjs && node test-terminal.mjs && node test-browserflow.mjs",
+    "test": "node test-toolcalls.mjs && node test-terminal.mjs && node test-session.mjs && node test-browserflow.mjs",
     "test:live": "node test-live.mjs"
   },
   "keywords": [
